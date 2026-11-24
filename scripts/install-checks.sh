@@ -1,4 +1,4 @@
-# The three checks of scripts/install-driver.sh that can be tested without an install, sourced by it
+# The four checks of scripts/install-driver.sh that can be tested without an install, sourced by it
 # and by tests/scripts/test-install-checks.sh (`make script-test`). Functions only: sourcing this file
 # runs nothing. Their variables start with ic_, so they do not change the caller's.
 
@@ -53,4 +53,55 @@ running_line() {
     echo "an older build is still running; version $3 loads when the modem re-enumerates"
     echo "(unplug it, or send AT+CFUN=1,1)"
   fi
+}
+
+# ipv6_only_preferred_line <the built driver's Info.plist> <configured value: 0 or 1>
+# Succeeds, printing nothing, when the plist has at least one RMNetDriver personality (IOUserClass
+# RMNetDriver), each of them has RMNetIPv6OnlyPreferred, an integer equal to the configured value, and
+# any other personality that has the key has it equal too. Otherwise prints one line saying what is
+# wrong, naming every personality that is (with "none" for a missing key and "not an integer" for one
+# of another type), and fails: a build with even one personality left at another value would match
+# that model with the setting the owner did not choose. Personalities are named in byte order.
+ipv6_only_preferred_line() {
+  if ! ic_names=$(plutil -extract IOKitPersonalities raw -expect dictionary -o - "$1" 2>/dev/null); then
+    echo "$1 has no IOKitPersonalities dictionary that can be read"
+    return 1
+  fi
+  ic_names=$(printf '%s\n' "$ic_names" | LC_ALL=C sort)
+  ic_drivers=0
+  ic_wrong=
+  while IFS= read -r ic_name; do
+    [ -n "$ic_name" ] || continue
+    case $ic_name in
+      *.*)
+        ic_wrong="$ic_wrong, $ic_name (a name with a '.', which plutil cannot reach)"
+        continue
+        ;;
+    esac
+    ic_key=IOKitPersonalities.$ic_name.RMNetIPv6OnlyPreferred
+    ic_class=$(plutil -extract "IOKitPersonalities.$ic_name.IOUserClass" raw -expect string -o - "$1" 2>/dev/null) ||
+      ic_class=
+    if [ "$ic_class" = RMNetDriver ]; then
+      ic_drivers=$((ic_drivers + 1))
+    elif ! plutil -extract "$ic_key" raw -o - "$1" >/dev/null 2>&1; then
+      continue  # not a driver personality, and without the key
+    fi
+    if ! plutil -extract "$ic_key" raw -o - "$1" >/dev/null 2>&1; then
+      ic_value=none
+    elif ! ic_value=$(plutil -extract "$ic_key" raw -expect integer -o - "$1" 2>/dev/null); then
+      ic_value="not an integer"
+    fi
+    [ "$ic_value" = "$2" ] || ic_wrong="$ic_wrong, $ic_name $ic_value"
+  done <<IC_NAMES
+$ic_names
+IC_NAMES
+  if [ "$ic_drivers" -eq 0 ]; then
+    echo "$1 has no RMNetDriver personality"
+    return 1
+  fi
+  if [ -n "$ic_wrong" ]; then
+    echo "RMNetIPv6OnlyPreferred is not $2 (as configured) in every personality of $1:${ic_wrong#,}"
+    return 1
+  fi
+  return 0
 }

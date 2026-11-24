@@ -1,7 +1,7 @@
 // CoreHost on the host: a fake UsbPort and RxSink stand in for the driver's USB and receive packets.
 // The tests cover the transmit hold (a frame refused while every uplink buffer is in flight), the
-// kept QMAP command replies, the pause limit (kPauseMaxMs), and the QMI interface number the session
-// puts in its requests.
+// kept QMAP command replies, the pause limit (kPauseMaxMs), the QMI interface number the session
+// puts in its requests, and the IPv6-only preferred setting the emulator is given.
 #include "minitest.h"
 
 #include <stdio.h>
@@ -402,4 +402,31 @@ TEST(the_session_names_the_qmi_interface_core_host_was_given) {
   std::vector<std::vector<uint8_t>> sent3 = sent_up_to_set_data_format(3);
   REQUIRE(sent3.size() == 3u);
   CHECK(sent3[2] == want);
+}
+
+// CoreHost gives its emulator the IPv6-only preferred setting it was made with: a DISCOVER asking
+// for option 108 (RFC 8925) on a link whose IPv4 address is in 192.0.0.0/29 is offered no address
+// with the setting on, and the link's address with it off (core/src/dhcp.cpp, top comment).
+// Synthetic fixtures only (frames.h): a made-up serial number and documentation addresses.
+TEST(core_host_gives_its_emulator_the_ipv6_only_preferred_setting) {
+  for (bool on : {true, false}) {
+    FakeUsb usb;
+    FakeRx rx;
+    rmnet::MacPair macs = rmnet::derive_macs(kSyntheticSerial);
+    CoreHost core(usb, rx, macs, 1, true, 4, on);
+    rmnet::LinkConfig cfg{};
+    cfg.settings = synthetic_clat_link();
+    core.link_up(cfg);
+    REQUIRE(core.take_link_change().up);
+    core.data_link_up(0);
+    size_t before = rx.frames.size();  // the router advertisement for the link's IPv6
+    std::vector<uint8_t> q = dhcp_from(macs.host, dhcp_client(1, on ? 1 : 2, "", "", {55, 2, 3, 108}));
+    CHECK(core.transmit(q.data(), q.size()));
+    REQUIRE(rx.frames.size() == before + 1);
+    DhcpReply d = parse_dhcp_reply(rx.frames.back().data(), rx.frames.back().size());
+    CHECK(d.checksums_ok);
+    CHECK_EQ(d.type, 2);
+    CHECK_EQ(d.yiaddr, on ? "0.0.0.0" : "192.0.0.2");
+    CHECK_EQ(d.v6only, on);
+  }
 }

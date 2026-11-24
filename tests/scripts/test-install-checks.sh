@@ -1,9 +1,11 @@
 #!/bin/sh
-# Tests of scripts/install-checks.sh, the three decisions scripts/install-driver.sh takes from it:
+# Tests of scripts/install-checks.sh, the four decisions scripts/install-driver.sh takes from it:
 # whether the installed app has the configured bundle ID (installed_id_line), which listed driver
-# versions have no kept app (missing_kept_apps), and the line about the running driver
-# (running_line). The listings under fixtures/ are in `systemextensionsctl list` format. Run by
-# `make script-test`; it installs nothing and reads nothing of the system's.
+# versions have no kept app (missing_kept_apps), the line about the running driver (running_line),
+# and whether every personality of the new build has the configured RMNetIPv6OnlyPreferred
+# (ipv6_only_preferred_line, on copies of driver/Info.plist edited with plutil). The listings under
+# fixtures/ are in `systemextensionsctl list` format. Run by `make script-test`; it installs nothing
+# and reads nothing of the system's.
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -30,7 +32,8 @@ check() {
 
 KEEP=$(mktemp -d "${TMPDIR:-/tmp}/install-checks.XXXXXX") || exit 1
 EMPTY_KEEP=$(mktemp -d "${TMPDIR:-/tmp}/install-checks.XXXXXX") || exit 1
-trap 'rm -rf "$KEEP" "$EMPTY_KEEP"' EXIT
+PL=$(mktemp -d "${TMPDIR:-/tmp}/install-checks.XXXXXX") || exit 1
+trap 'rm -rf "$KEEP" "$EMPTY_KEEP" "$PL"' EXIT
 mkdir "$KEEP/RMNet-317.18.40.app"
 
 # --- installed_id_line <installed app's bundle ID> <configured bundle ID> ---
@@ -89,6 +92,57 @@ check "the new build's CDHash cannot be read" \
   "$(running_line '' 4c5b6a 317.18.41)"
 check "neither CDHash: no running driver is the answer" \
   "no RMNetDriver attached (modem not attached in QMI mode?)" "$(running_line '' '' 317.18.41)"
+
+# --- ipv6_only_preferred_line <the built driver's Info.plist> <configured value> ---
+
+# The line and the return status, "<line>|<status>", with the plists' directory left out of the line.
+v6_line() {
+  vl=$(ipv6_only_preferred_line "$PL/$1" "$2")
+  printf '%s|%s\n' "$vl" "$?" | sed "s#$PL/##g"
+}
+# plist <name> <copy of>: a copy, edited after with plutil.
+plist() { cp "$PL/$2" "$PL/$1"; }
+
+cp driver/Info.plist "$PL/off.plist"
+awk '/<key>RMNetIPv6OnlyPreferred<\/key>/ { print; getline; sub(/<integer>0</, "<integer>1<") } { print }' \
+  "$PL/off.plist" >"$PL/on.plist"
+check "driver/Info.plist, configured 0: every personality agrees" "|0" "$(v6_line off.plist 0)"
+check "a build with each personality's 0 turned to 1, configured 1: every personality agrees" "|0" "$(v6_line on.plist 1)"
+check "driver/Info.plist, configured 1: refused, every RMNetDriver personality named" \
+  "RMNetIPv6OnlyPreferred is not 1 (as configured) in every personality of off.plist: RMNetDriver 0, RMNetDriver_0121 0, RMNetDriver_0122 0, RMNetDriver_0125 0, RMNetDriver_013d 0, RMNetDriver_0191 0, RMNetDriver_0195 0, RMNetDriver_0296 0, RMNetDriver_0306 0, RMNetDriver_030b 0, RMNetDriver_030e 0, RMNetDriver_0512 0, RMNetDriver_0620 0, RMNetDriver_0800 0|1" \
+  "$(v6_line off.plist 1)"
+plist one-off.plist on.plist
+plutil -replace IOKitPersonalities.RMNetDriver_0800.RMNetIPv6OnlyPreferred -integer 0 "$PL/one-off.plist"
+check "one personality other than the main one left at 0: refused, naming it" \
+  "RMNetIPv6OnlyPreferred is not 1 (as configured) in every personality of one-off.plist: RMNetDriver_0800 0|1" \
+  "$(v6_line one-off.plist 1)"
+plist main-missing.plist on.plist
+plutil -remove IOKitPersonalities.RMNetDriver.RMNetIPv6OnlyPreferred "$PL/main-missing.plist"
+check "the main personality without the key: refused" \
+  "RMNetIPv6OnlyPreferred is not 1 (as configured) in every personality of main-missing.plist: RMNetDriver none|1" \
+  "$(v6_line main-missing.plist 1)"
+plist several.plist one-off.plist
+plutil -remove IOKitPersonalities.RMNetDriver_0121.RMNetIPv6OnlyPreferred "$PL/several.plist"
+plutil -replace IOKitPersonalities.RMNetDriver_0122.RMNetIPv6OnlyPreferred -string 1 "$PL/several.plist"
+check "a missing key, a string and a 0: each named, in byte order" \
+  "RMNetIPv6OnlyPreferred is not 1 (as configured) in every personality of several.plist: RMNetDriver_0121 none, RMNetDriver_0122 not an integer, RMNetDriver_0800 0|1" \
+  "$(v6_line several.plist 1)"
+plist serial-other.plist on.plist
+plutil -insert IOKitPersonalities.RMNetSerialDIAG.RMNetIPv6OnlyPreferred -integer 0 "$PL/serial-other.plist"
+check "another personality with the key at another value: refused" \
+  "RMNetIPv6OnlyPreferred is not 1 (as configured) in every personality of serial-other.plist: RMNetSerialDIAG 0|1" \
+  "$(v6_line serial-other.plist 1)"
+plist serial-same.plist on.plist
+plutil -insert IOKitPersonalities.RMNetSerialDIAG.RMNetIPv6OnlyPreferred -integer 1 "$PL/serial-same.plist"
+check "another personality with the key at the configured value: agrees" "|0" "$(v6_line serial-same.plist 1)"
+check "a serial personality without the key is not asked for it" "|0" "$(v6_line on.plist 1)"
+plist no-driver.plist off.plist
+for name in $(plutil -extract IOKitPersonalities raw -expect dictionary -o - "$PL/off.plist" | grep '^RMNetDriver'); do
+  plutil -remove "IOKitPersonalities.$name" "$PL/no-driver.plist"
+done
+check "no RMNetDriver personality: refused" "no-driver.plist has no RMNetDriver personality|1" "$(v6_line no-driver.plist 0)"
+check "no such plist: refused" "missing.plist has no IOKitPersonalities dictionary that can be read|1" \
+  "$(v6_line missing.plist 0)"
 
 echo "test-install-checks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

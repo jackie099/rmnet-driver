@@ -266,8 +266,8 @@ build/replyeditor-tests: app/PlainTextEditor.swift tests/app/PlainTextEditorTest
 # The scripts' decisions that need neither the network nor an install: the install script's
 # installed-app ID, kept-app and running-driver checks (scripts/install-checks.sh), soak.sh's status
 # classes (--classify), the driver's personalities against the model list
-# (scripts/check-personalities.sh), and the build's team and bundle IDs from config.local or the
-# environment (scripts/config.sh, gen.rb's options).
+# (scripts/check-personalities.sh), and the build's team and bundle IDs and its IPv6-only preferred
+# setting from config.local or the environment (scripts/config.sh, gen.rb's options).
 script-test:
 	sh tests/scripts/test-install-checks.sh
 	sh tests/scripts/test-soak-classify.sh
@@ -276,13 +276,33 @@ script-test:
 
 # Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj, with
 # the bundle ID in RMNET_BUNDLE_ID when it is set (environment or make's command line; config.local
-# is not read here), else the default.
+# is not read here), else the default, and with the driver's RMNetIPv6OnlyPreferred 1 when
+# RMNET_IPV6_ONLY_PREFERRED is 1, else 0 as in driver/Info.plist.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \
 	SYMROOT="$(CURDIR)/build/xcode" OBJROOT="$(CURDIR)/build/xcode/obj" \
 	CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
+# RMNET_IPV6_ONLY_PREFERRED is compared here as it is, before it reaches any command: $(value ...)
+# leaves a $(...) in it unexpanded, and ifeq keeps its blanks. Empty, 0 and 1 give the constant gen.rb
+# argument below; any other value stops the driver target before any of its commands runs (the
+# message, through $(error), quotes it without expanding it), and leaves every other target alone.
+# Only that constant reaches the shell, never the value itself, so the variable must never be
+# expanded as itself anywhere in this file, only through $(value ...).
+# (On make's command line, VAR= 1 is make's own assignment syntax and gives 1, as in a makefile; a
+# blank after the value is kept and refused.)
+ifeq ($(value RMNET_IPV6_ONLY_PREFERRED),)
+  GEN_IPV6_ONLY_PREFERRED :=
+else ifeq ($(value RMNET_IPV6_ONLY_PREFERRED),0)
+  GEN_IPV6_ONLY_PREFERRED := --ipv6-only-preferred 0
+else ifeq ($(value RMNET_IPV6_ONLY_PREFERRED),1)
+  GEN_IPV6_ONLY_PREFERRED := --ipv6-only-preferred 1
+else
+  GEN_IPV6_ONLY_PREFERRED_REFUSED := RMNET_IPV6_ONLY_PREFERRED '$(value RMNET_IPV6_ONLY_PREFERRED)' is not empty, 0 or 1
+endif
+
 driver:
-	/usr/bin/ruby gen.rb $(if $(RMNET_BUNDLE_ID),--bundle-id $(RMNET_BUNDLE_ID))
+	$(if $(GEN_IPV6_ONLY_PREFERRED_REFUSED),$(error $(GEN_IPV6_ONLY_PREFERRED_REFUSED); nothing was built))
+	/usr/bin/ruby gen.rb $(if $(RMNET_BUNDLE_ID),--bundle-id $(RMNET_BUNDLE_ID)) $(GEN_IPV6_ONLY_PREFERRED)
 	$(XCODEBUILD) -target RMNetDriver build
 	$(XCODEBUILD) -target RMNet build
 	@echo "driver build ok"

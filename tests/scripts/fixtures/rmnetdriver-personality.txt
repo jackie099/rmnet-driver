@@ -5,6 +5,7 @@ Dict {
     idProduct = 2049
     bConfigurationValue = 1
     IOUserServerName = $(PRODUCT_BUNDLE_IDENTIFIER)
+    RMNetIPv6OnlyPreferred = 0
     idVendor = 11388
     CFBundleIdentifierKernel = com.apple.iokit.IOSkywalkFamily
     RMNetProfile = 1

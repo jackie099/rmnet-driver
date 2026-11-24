@@ -90,6 +90,7 @@ public:
     void ApplyCore() LOCALONLY;
     void PublishStatus() LOCALONLY;
     void PublishProfile(uint8_t profile) LOCALONLY;
+    void PublishIpv6OnlyPreferred(bool on) LOCALONLY;
     IOReturn ReportLink() LOCALONLY;
     bool FirstCall(uint32_t flag) LOCALONLY;
 };

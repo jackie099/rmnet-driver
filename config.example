@@ -6,3 +6,11 @@
 RMNET_TEAM_ID=
 # A bundle ID you own, for the app; the driver gets <this>.driver. Example: com.example.RMNet
 RMNET_BUNDLE_ID=
+# 1 builds the driver with IPv6-only preferred on (RMNetIPv6OnlyPreferred in its personalities): a
+# DHCP client that asks for RFC 8925's IPv6-Only Preferred option (108) is offered no IPv4 address
+# when the modem's IPv4 address is in 192.0.0.0/29 and the link has IPv6, and runs its own 464XLAT
+# translator (CLAT) instead. Turn it on only for a network you know provides NAT64, such as an
+# IPv6-only network with 464XLAT (T-Mobile US, for one); without NAT64 the client loses IPv4. It is
+# off by default because the modem's address does not tell such a network apart: RFC 7335 section 4
+# shares 192.0.0.0/29 with DS-Lite, which has no NAT64. 0 or empty leaves it off.
+RMNET_IPV6_ONLY_PREFERRED=0

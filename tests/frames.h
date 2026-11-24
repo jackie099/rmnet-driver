@@ -119,8 +119,10 @@ inline rmnet::RuntimeSettings link_settings() {
 
 // Broadcast DHCP client message (BOOTP op 1) from the host MAC: IPv4 from ciaddr (or 0.0.0.0)
 // to 255.255.255.255, UDP 68 to 67 with a valid checksum. Options: 53 `type`, then 50 with
-// `requested_ip` unless it is empty, then 255. An empty `ciaddr` leaves ciaddr zero.
-inline std::vector<uint8_t> dhcp_client(uint8_t type, uint32_t xid, const char* requested_ip, const char* ciaddr) {
+// `requested_ip` unless it is empty, then the bytes of `extra_options` as given, then 255. An
+// empty `ciaddr` leaves ciaddr zero.
+inline std::vector<uint8_t> dhcp_client(uint8_t type, uint32_t xid, const char* requested_ip, const char* ciaddr,
+                                        const std::vector<uint8_t>& extra_options = {}) {
   std::vector<uint8_t> ci = *ciaddr ? ipv4(ciaddr) : std::vector<uint8_t>(4, 0);
   std::vector<uint8_t> b(236, 0);
   b[0] = 1;  // op BOOTREQUEST
@@ -135,6 +137,7 @@ inline std::vector<uint8_t> dhcp_client(uint8_t type, uint32_t xid, const char* 
     std::vector<uint8_t> r = ipv4(requested_ip);
     opts.push_back(50); opts.push_back(4); opts.insert(opts.end(), r.begin(), r.end());
   }
+  opts.insert(opts.end(), extra_options.begin(), extra_options.end());
   opts.push_back(255);
   b.insert(b.end(), opts.begin(), opts.end());
 
@@ -164,6 +167,9 @@ struct DhcpReply {
   std::string mask, router;
   std::vector<std::string> dns;
   int mtu = 0;
+  bool v6only = false;      // option 108 present with length 4 (RFC 8925)
+  uint32_t v6only_wait = 0;
+  int auto_configure = -1;  // option 116's byte (RFC 2563), -1 when absent
   std::string ip_src, ip_dst;
   bool checksums_ok = false;  // IPv4 header and UDP (pseudo-header included); a zero UDP checksum fails
 };
@@ -213,6 +219,13 @@ inline DhcpReply parse_dhcp_reply(const uint8_t* bytes, size_t len) {
       case 3: if (n >= 4) d.router = dotted(v); break;
       case 6: for (size_t k = 0; k + 4 <= n; k += 4) d.dns.push_back(dotted(v + k)); break;
       case 26: if (n == 2) d.mtu = v[0] << 8 | v[1]; break;
+      case 108:
+        if (n == 4) {
+          d.v6only = true;
+          d.v6only_wait = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
+        }
+        break;
+      case 116: if (n == 1) d.auto_configure = v[0]; break;
       default: break;
     }
     i += 2 + n;
@@ -372,4 +385,63 @@ inline NdReply parse_nd_reply(const uint8_t* bytes, size_t len) {
     i += n;
   }
   return d;
+}
+
+// Synthetic fixtures, recorded from no modem: a made-up USB serial number, and documentation
+// addresses (IPv4 from RFC 5737's TEST-NET blocks, IPv6 from RFC 3849's 2001:db8::/32). 192.0.0.0/29
+// is a protocol prefix (RFC 7335), not any network's address.
+
+// The USB serial number the synthetic tests derive their MACs from.
+inline const char* kSyntheticSerial = "SYNTHETIC-SERIAL-0001";
+
+// Copies the bytes of `v` to `dst`.
+inline void put_bytes(uint8_t* dst, const std::vector<uint8_t>& v) {
+  for (size_t i = 0; i < v.size(); ++i) dst[i] = v[i];
+}
+
+// A dual-stack link: IPv4 198.51.100.10/30 behind 198.51.100.9, DNS 192.0.2.53 and 192.0.2.54;
+// IPv6 2001:db8:0:1::10/64 behind 2001:db8:0:1::1, DNS 2001:db8::53 and 2001:db8::54; MTU 1500.
+inline rmnet::RuntimeSettings synthetic_link() {
+  rmnet::RuntimeSettings s{};
+  s.has_v4 = true;
+  put_bytes(s.v4_addr, ipv4("198.51.100.10"));
+  put_bytes(s.v4_gateway, ipv4("198.51.100.9"));
+  put_bytes(s.v4_mask, ipv4("255.255.255.252"));
+  put_bytes(s.v4_dns[0], ipv4("192.0.2.53"));
+  put_bytes(s.v4_dns[1], ipv4("192.0.2.54"));
+  s.v4_dns_count = 2;
+  s.has_v6 = true;
+  put_bytes(s.v6_addr, ipv6("2001:db8:0:1::10"));
+  s.v6_prefix_len = 64;
+  put_bytes(s.v6_gateway, ipv6("2001:db8:0:1::1"));
+  put_bytes(s.v6_dns[0], ipv6("2001:db8::53"));
+  put_bytes(s.v6_dns[1], ipv6("2001:db8::54"));
+  s.v6_dns_count = 2;
+  s.mtu = 1500;
+  return s;
+}
+
+// synthetic_link() as a modem running its own 464XLAT translator reports it: IPv4 192.0.0.2/27
+// behind 192.0.0.1 (RFC 7335's prefix). A DS-Lite host uses the same two addresses (RFC 6333
+// section 5.7), so the link alone does not show whether the network has NAT64.
+inline rmnet::RuntimeSettings synthetic_clat_link() {
+  rmnet::RuntimeSettings s = synthetic_link();
+  put_bytes(s.v4_addr, ipv4("192.0.0.2"));
+  put_bytes(s.v4_gateway, ipv4("192.0.0.1"));
+  put_bytes(s.v4_mask, ipv4("255.255.255.224"));
+  return s;
+}
+
+// A frame dhcp_client() made, sent from `host` instead of kHostMac: the Ethernet source and chaddr
+// rewritten, and the UDP checksum computed again.
+inline std::vector<uint8_t> dhcp_from(const uint8_t host[6], std::vector<uint8_t> f) {
+  uint8_t* ip = f.data() + 14;
+  uint8_t* udp = ip + 20;
+  for (int i = 0; i < 6; ++i) f[6 + i] = udp[8 + 28 + i] = host[i];
+  size_t udp_len = (size_t)(udp[4] << 8 | udp[5]);
+  udp[6] = udp[7] = 0;
+  uint16_t c = rmnet::udp4_checksum(ip + 12, ip + 16, udp, udp_len);
+  if (c == 0) c = 0xffff;
+  udp[6] = (uint8_t)(c >> 8); udp[7] = (uint8_t)c;
+  return f;
 }

@@ -97,8 +97,11 @@ class CoreHost final : public rmnet::SessionDelegate {
   // (SessionConfig::flow_control).
   // qmi_interface: the number of the USB interface the session runs on, which its requests name
   // (SessionConfig::iface_number; 4 on the RM520N-GL).
+  // ipv6_only_preferred: whether the emulator's DHCP server may answer with the IPv6-Only
+  // Preferred option (rmnet::EthernetEmulator, core/src/dhcp.cpp); off unless the installer
+  // turned it on.
   CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control,
-           uint8_t qmi_interface);
+           uint8_t qmi_interface, bool ipv6_only_preferred = false);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 

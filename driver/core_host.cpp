@@ -71,11 +71,11 @@ const char* SessionStateName(rmnet::SessionState s) {
 }
 
 CoreHost::CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control,
-                   uint8_t qmi_interface)
+                   uint8_t qmi_interface, bool ipv6_only_preferred)
     : usb_(usb),
       rx_(rx),
       session_(MakeSessionConfig(profile, flow_control, qmi_interface), *this),
-      eth_(macs),
+      eth_(macs, ipv6_only_preferred),
       agg_(nullptr, 0, 0, 0),
       uplink_slot_(-1),
       slot_packets_(),

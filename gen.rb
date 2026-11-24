@@ -1,38 +1,65 @@
 #!/usr/bin/ruby
 # Generates RMNet.xcodeproj: the RMNetDriver dext (driver/ plus Core) and the RMNet host app that embeds it.
 #
-# Usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID]
+# Usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID] [--ipv6-only-preferred 0|1]
 #   With a team ID both targets use Xcode automatic signing for that team; without one no signing
 #   settings are written and the project is only built with signing turned off (make driver).
 #   BUNDLE_ID is the app's (default io.rmnetdriver.RMNet); the driver's is BUNDLE_ID.driver.
-#   scripts/install-driver.sh passes both from config.local (scripts/config.sh); make driver passes
-#   --bundle-id only when RMNET_BUNDLE_ID is set.
+#   --ipv6-only-preferred 1 builds the driver with RMNetIPv6OnlyPreferred 1 in its personalities
+#   (core/src/dhcp.cpp, top comment), from a copy of driver/Info.plist written to
+#   build/gen/driver/Info.plist; 0, the default, builds it from driver/Info.plist, where it is 0.
+#   scripts/install-driver.sh passes all three from config.local (scripts/config.sh); make driver
+#   passes --bundle-id and --ipv6-only-preferred only when RMNET_BUNDLE_ID and
+#   RMNET_IPV6_ONLY_PREFERRED are set.
 #
 # Every path in the project is relative to the repository root (this file's directory), and object
 # identifiers are derived from the project's contents, so the output is the same from any working
 # directory, in any clone or worktree. Sources are collected by wildcard: a new driver/*.cpp,
 # driver/*.iig or core/src/*.cpp needs no edit here.
+require 'fileutils'
 require 'xcodeproj'
 
 ROOT    = __dir__
 VERSION = '1.0'
 Obj     = Xcodeproj::Project::Object
-USAGE   = 'usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID]'
+USAGE   = 'usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID] [--ipv6-only-preferred 0|1]'
 
 team   = nil
 app_id = 'io.rmnetdriver.RMNet'
+v6only = '0'
 args   = ARGV.dup
 until args.empty?
   case args.shift
-  when '--team'      then team = args.shift or abort(USAGE)
-  when '--bundle-id' then app_id = args.shift or abort(USAGE)
+  when '--team'                then team = args.shift or abort(USAGE)
+  when '--bundle-id'           then app_id = args.shift or abort(USAGE)
+  when '--ipv6-only-preferred' then v6only = args.shift or abort(USAGE)
   else abort(USAGE)
   end
 end
 abort("gen.rb: '#{team}' is not a team ID") if team && team !~ /\A[A-Z0-9]{10}\z/
 abort("gen.rb: '#{app_id}' is not a bundle ID") if app_id !~ /\A[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\z/
+abort("gen.rb: '#{v6only}' is not 0 or 1 (--ipv6-only-preferred)") if v6only !~ /\A[01]\z/
 APP_ID = app_id
 DRV_ID = "#{APP_ID}.driver"
+
+# The driver's Info.plist. driver/Info.plist has RMNetIPv6OnlyPreferred 0 in every RMNetDriver
+# personality. With --ipv6-only-preferred 1 each of them is 1 in the copy the driver is built from;
+# the copy differs from driver/Info.plist in those values only. Written before the project, so a
+# refusal leaves no project behind.
+INFO_PLIST = if v6only == '1'
+               src  = File.read(File.join(ROOT, 'driver/Info.plist'))
+               off  = %r{(<key>RMNetIPv6OnlyPreferred</key>\s*)<integer>0</integer>}
+               keys = src.scan(%r{<key>RMNetIPv6OnlyPreferred</key>}).size
+               if keys.zero? || src.scan(off).size != keys
+                 abort('gen.rb: driver/Info.plist does not have RMNetIPv6OnlyPreferred 0 wherever it has the key')
+               end
+               path = 'build/gen/driver/Info.plist'
+               FileUtils.mkdir_p(File.join(ROOT, File.dirname(path)))
+               File.write(File.join(ROOT, path), src.gsub(off, '\1<integer>1</integer>'))
+               path
+             else
+               'driver/Info.plist'
+             end
 
 signing = if team
             {
@@ -92,7 +119,7 @@ drv = native_target(
     'PRODUCT_NAME'                 => '$(PRODUCT_BUNDLE_IDENTIFIER)',
     'CURRENT_PROJECT_VERSION'      => '1',
     'MARKETING_VERSION'            => VERSION,
-    'INFOPLIST_FILE'               => 'driver/Info.plist',
+    'INFOPLIST_FILE'               => INFO_PLIST,
     'CODE_SIGN_ENTITLEMENTS'       => 'driver/Driver.entitlements',
     'ENABLE_APP_SANDBOX'           => 'YES',
     'CLANG_CXX_LANGUAGE_STANDARD'  => 'c++17',
@@ -177,4 +204,5 @@ app.add_dependency(drv)
 # so it is stable only after a second pass.
 2.times { proj.predictabilize_uuids }
 proj.save
-puts "gen.rb: wrote RMNet.xcodeproj for #{APP_ID}#{team ? " (signing team #{team})" : ' (no signing)'}"
+puts "gen.rb: wrote RMNet.xcodeproj for #{APP_ID}#{team ? " (signing team #{team})" : ' (no signing)'}" \
+     "#{v6only == '1' ? ", IPv6-only preferred on (#{INFO_PLIST})" : ''}"

@@ -39,7 +39,8 @@ MacPair derive_macs(const char* usb_serial) {
   return m;
 }
 
-EthernetEmulator::EthernetEmulator(const MacPair& macs) : macs_(macs), link_(), link_up_(false) {}
+EthernetEmulator::EthernetEmulator(const MacPair& macs, bool ipv6_only_preferred)
+    : macs_(macs), link_(), link_up_(false), ipv6_only_preferred_(ipv6_only_preferred) {}
 
 void EthernetEmulator::set_link(const RuntimeSettings* settings) {
   if (settings) {

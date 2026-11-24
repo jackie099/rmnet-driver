@@ -44,6 +44,7 @@ constexpr uint32_t kMinMtu = 576;
 constexpr uint8_t kDefaultProfile = 1;
 constexpr const char* kProfileKey = "RMNetProfile";
 constexpr const char* kFlowControlKey = "RMNetFlowControl";
+constexpr const char* kIpv6OnlyPreferredKey = "RMNetIPv6OnlyPreferred";
 constexpr const char* kInterfaceKey = "bInterfaceNumber";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
@@ -226,6 +227,36 @@ bool ReadFlowControl(IOService* service) {
   }
   OSSafeReleaseNULL(props);
   return flowControl;
+}
+
+// Whether the emulator's DHCP server may answer a client that asks for it with the IPv6-Only
+// Preferred option (RFC 8925, option 108) on a link whose IPv4 address is in 192.0.0.0/29
+// (core/src/dhcp.cpp, top comment), from the service's RMNetIPv6OnlyPreferred property (the
+// personality in Info.plist sets it: 0 there, 1 in a build made with RMNET_IPV6_ONLY_PREFERRED=1):
+// the integer 1 turns it on. 0, any other value, or no such property leaves it off; anything but 0
+// or 1 is logged. Off is the safe side: with it on where the network has no NAT64 (DS-Lite, say), a
+// client would give up IPv4.
+bool ReadIpv6OnlyPreferred(IOService* service) {
+  OSDictionary* props = nullptr;
+  kern_return_t ret = service->CopyProperties(&props);
+  bool on = false;
+  if (ret != kIOReturnSuccess || !props) {
+    LOG("RMNetIPv6OnlyPreferred: properties not readable (0x%x); IPv6-only preferred off", ret);
+  } else {
+    OSObject* obj = props->getObject(kIpv6OnlyPreferredKey);
+    OSNumber* num = OSDynamicCast(OSNumber, obj);
+    if (!obj) {
+      LOG("RMNetIPv6OnlyPreferred: no such property; IPv6-only preferred off");
+    } else if (!num) {
+      LOG("RMNetIPv6OnlyPreferred: not an integer; IPv6-only preferred off");
+    } else if (num->unsigned64BitValue() > 1) {
+      LOG("RMNetIPv6OnlyPreferred: %llu is not 0 or 1; IPv6-only preferred off", num->unsigned64BitValue());
+    } else {
+      on = num->unsigned64BitValue() == 1;
+    }
+  }
+  OSSafeReleaseNULL(props);
+  return on;
 }
 
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -452,9 +483,13 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     PublishProfile(profile);
     bool flowControl = ReadFlowControl(this);
     LOG("flow control %u", flowControl ? 1u : 0u);
+    bool v6OnlyPreferred = ReadIpv6OnlyPreferred(this);
+    LOG("IPv6-only preferred %u", v6OnlyPreferred ? 1u : 0u);
+    PublishIpv6OnlyPreferred(v6OnlyPreferred);
     ivars->rxBridge = new RxBridge(this);
     if (ivars->rxBridge) {
-      ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl, qmiInterface);
+      ivars->core =
+          new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl, qmiInterface, v6OnlyPreferred);
     }
     if (!ivars->core) ret = kIOReturnNoMemory;
   }
@@ -920,6 +955,21 @@ void RMNetDriver::PublishProfile(uint8_t profile) {
     props->setObject(kProfileKey, n);
     kern_return_t ret = SetProperties(props);
     if (ret != kIOReturnSuccess) LOG("SetProperties (profile) 0x%x", ret);
+  }
+  OSSafeReleaseNULL(n);
+  OSSafeReleaseNULL(props);
+}
+
+// Publishes whether IPv6-only preferred is on as RMNetIPv6OnlyPreferred (0 or 1), over the
+// personality's value, so the registry shows what the DHCP server does, whatever the personality
+// held. A failure is logged and does not fail Start.
+void RMNetDriver::PublishIpv6OnlyPreferred(bool on) {
+  OSDictionary* props = OSDictionary::withCapacity(1);
+  OSNumber* n = OSNumber::withNumber(static_cast<uint64_t>(on ? 1 : 0), 32);
+  if (props && n) {
+    props->setObject(kIpv6OnlyPreferredKey, n);
+    kern_return_t ret = SetProperties(props);
+    if (ret != kIOReturnSuccess) LOG("SetProperties (IPv6-only preferred) 0x%x", ret);
   }
   OSSafeReleaseNULL(n);
   OSSafeReleaseNULL(props);

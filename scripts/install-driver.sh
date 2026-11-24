@@ -6,7 +6,8 @@
 # same version; the script refuses the second rather than install a build the system would not load.
 # The first activation needs the owner's approval in System Settings. The signing team and the
 # bundle IDs come from config.local or the environment (scripts/config.sh, config.example); the
-# script refuses, before anything is built, unless both are set.
+# script refuses, before anything is built, unless both are set. RMNET_IPV6_ONLY_PREFERRED=1 there
+# builds the driver with RMNetIPv6OnlyPreferred 1 (gen.rb; config.example says when to).
 #
 # A driver can only be deactivated by an app that embeds that exact driver version, so a copy of
 # every app that asks for activation is kept in build/installed/RMNet-<version>.app
@@ -18,8 +19,8 @@
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
-. ./scripts/install-checks.sh # installed_id_line, missing_kept_apps, running_line
-. ./scripts/config.sh         # rmnet_config_require: TEAM_ID, BUNDLE_ID, DRIVER_ID
+. ./scripts/install-checks.sh # installed_id_line, missing_kept_apps, running_line, ipv6_only_preferred_line
+. ./scripts/config.sh         # rmnet_config_require: TEAM_ID, BUNDLE_ID, DRIVER_ID, IPV6_ONLY_PREFERRED
 rmnet_config_require || exit 2
 
 BUILD="$PWD/build/xcode-signed"
@@ -98,8 +99,8 @@ if [ "$installed" = "$VERSION" ]; then
   exit 1
 fi
 
-step "generate RMNet.xcodeproj for team $TEAM_ID, bundle ID $BUNDLE_ID"
-/usr/bin/ruby gen.rb --team "$TEAM_ID" --bundle-id "$BUNDLE_ID"
+step "generate RMNet.xcodeproj for team $TEAM_ID, bundle ID $BUNDLE_ID, IPv6-only preferred $IPV6_ONLY_PREFERRED"
+/usr/bin/ruby gen.rb --team "$TEAM_ID" --bundle-id "$BUNDLE_ID" --ipv6-only-preferred "$IPV6_ONLY_PREFERRED"
 
 step "signed build, version $VERSION"
 rm -rf "$NEW"
@@ -110,6 +111,13 @@ xcodebuild -project RMNet.xcodeproj -target RMNet -configuration Release -parall
 step "check the new build"
 built=$(/usr/bin/defaults read "$NEW/Contents/Info" CFBundleVersion 2>/dev/null || true)
 [ "$built" = "$VERSION" ] || { echo "install-driver: $NEW missing or not version $VERSION" >&2; exit 1; }
+# Every RMNetDriver personality of the built driver has the configured RMNetIPv6OnlyPreferred, and
+# no personality another value.
+if ! v6only_line=$(ipv6_only_preferred_line "$NEW/Contents/Library/SystemExtensions/$DRIVER_ID.dext/Info.plist" \
+  "$IPV6_ONLY_PREFERRED"); then
+  echo "install-driver: the new build: $v6only_line" >&2
+  exit 1
+fi
 
 step "keep the app being replaced"
 read_listing "before anything is changed"

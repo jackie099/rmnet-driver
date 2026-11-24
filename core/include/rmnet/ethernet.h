@@ -33,7 +33,10 @@ struct TxResult {
 
 class EthernetEmulator {
  public:
-  explicit EthernetEmulator(const MacPair& macs);
+  // ipv6_only_preferred: whether DHCP may answer a client that asks for it with the IPv6-Only
+  // Preferred option (RFC 8925, option 108) on a link that looks like a 464XLAT one (dhcp.cpp,
+  // top comment). Off unless the installer turned it on for a network known to provide NAT64.
+  explicit EthernetEmulator(const MacPair& macs, bool ipv6_only_preferred = false);
 
   // Copies *settings; nullptr means the link is down.
   void set_link(const RuntimeSettings* settings);
@@ -84,6 +87,7 @@ class EthernetEmulator {
   MacPair macs_;
   RuntimeSettings link_;
   bool link_up_;
+  bool ipv6_only_preferred_;
 };
 
 }  // namespace rmnet
