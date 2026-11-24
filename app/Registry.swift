@@ -72,3 +72,19 @@ func readStatus(entries: [ExtensionEntry]) -> DriverStatus {
     return DriverStatus(entries: entries, modem: modem, modemModel: model, attached: driver != nil,
                         properties: driver ?? [:])
 }
+
+// The attached modem's USB serial number (its "USB Serial Number" property, as `ioreg` shows it), nil when none of
+// quectelModels is attached or it gives none. An IMEI change does not touch it, so the IMEI history tells modules apart
+// by it (ImeiHistory.swift).
+func readModemSerial() -> String? {
+    for model in quectelModels {
+        let device = firstService("IOUSBHostDevice", withProperties: ["idVendor": modemVendor, "idProduct": model.product])
+        guard device != IO_OBJECT_NULL else { continue }
+        defer { IOObjectRelease(device) }
+        let p = properties(of: device)
+        let serial = (p["USB Serial Number"] as? String) ?? (p["kUSBSerialNumberString"] as? String)
+        guard let serial, !serial.isEmpty else { return nil }
+        return String(serial.unicodeScalars.filter { $0.isASCII && $0.value >= 0x20 && $0.value < 0x7F }.prefix(64))
+    }
+    return nil
+}

@@ -1,9 +1,11 @@
-// The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon (MenuBarLabel), and the panel it
-// opens, the connection at a glance as the Overview shows it: the state's pill from the Driver screen's headline, the
-// technology's badge, the bars with their word, the operator and the band from the network read over the AT port
-// when the panel opens (with its time, or why it failed), the IPv4 address while the link is up, the window's quit
-// lines while a quit waits, `Open RMNet` and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and
-// decides when the port is read; this file only shows it, with DesignKit's pieces.
+// The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon (MenuBarLabel: the antenna, or the
+// signal bars drawn by menuBarSignalImage, as chosen in Settings), and the panel it opens, the connection at a glance
+// as the Overview shows it: the state's pill from the Driver screen's headline, the technology's badge, the bars with
+// their word, the operator and the band from the network read over the AT port when the panel opens (with its time,
+// or why it failed), the IPv4 address while the link is up, how many messages are unread (a click opens Messages), the
+// window's quit lines while a quit waits, `Open RMNet`,
+// a gear that opens Settings, and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and decides when
+// the port is read; this file only shows it, with DesignKit's pieces.
 import AppKit
 import SwiftUI
 
@@ -11,7 +13,10 @@ extension MenuBarStatus {
     /// The app's one, on the registry, the system's listing (asked with a 10 s limit) and the network read with
     /// ModemService on `queue`, the queue the window's screens share for the AT port. The app delegate starts its
     /// polls at launch (`start`).
-    static func forApp(queue: DispatchQueue) -> MenuBarStatus {
+    /// The signal bars' reads are the app's background turn's (ModemPulse.swift, which the app delegate gives the
+    /// bars' part to); they take the window's network read instead while it is fresh (`freshInfo`).
+    static func forApp(queue: DispatchQueue,
+                       freshInfo: @escaping () -> (info: NetworkInfo, at: Date)? = { nil }) -> MenuBarStatus {
         let manager = ExtensionManager()
         let service = ModemService()
         let status = MenuBarStatus(
@@ -23,20 +28,104 @@ extension MenuBarStatus {
                 }
             },
             network: { service.networkInfo() },
-            queue: queue)
+            queue: queue,
+            freshInfo: freshInfo,
+            preference: MenuBarIconPreference(defaults: .standard))
         return status
     }
 }
 
-/// The item's icon in the menu bar: the antenna, struck through unless the link is up; its title, the
-/// accessibility label, is not drawn. The only view of the item that observes the model besides the panel.
+/// The item's icon in the menu bar, in the style chosen in Settings: the antenna, struck through unless the link is
+/// up; or the signal bars (menuBarSignalImage). Its title, the accessibility label, is not drawn. The only view of the
+/// item that observes the model besides the panel.
 struct MenuBarLabel: View {
     @ObservedObject var status: MenuBarStatus
 
     var body: some View {
-        Label(status.icon.accessibilityLabel, systemImage: status.icon.symbolName)
-            .labelStyle(.iconOnly)
+        switch status.iconStyle {
+        case .antenna:
+            Label(status.icon.accessibilityLabel, systemImage: status.icon.symbolName)
+                .labelStyle(.iconOnly)
+        case .signal:
+            let icon = status.signalIcon
+            Image(nsImage: menuBarSignalImage(icon))
+                .accessibilityLabel(Text(verbatim: icon.accessibilityLabel))
+        }
     }
+}
+
+/// The signal bars as a template image for the menu bar (the system colours it), 16 pt high: four bars rising, those
+/// up to the level filled and the others faint (or every bar outlined when the level is not known), then the
+/// technology ("5G", "LTE") or a mark ("!" waiting for approval, "…" searching) in small bold type; a slash through
+/// the bars when there is no connection or no driver; an airplane alone with the radio off. Dimmed while the level is
+/// old.
+func menuBarSignalImage(_ icon: MenuBarSignalIcon) -> NSImage {
+    let alpha: CGFloat = icon.dimmed ? 0.45 : 1
+    if icon.airplane, let plane = NSImage(systemSymbolName: "airplane", accessibilityDescription: nil)?
+        .withSymbolConfiguration(.init(pointSize: 13, weight: .medium)) {
+        let size = plane.size
+        let image = NSImage(size: size, flipped: false) { rect in
+            plane.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha)
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+    let barWidth: CGFloat = 3, gap: CGFloat = 1.5, height: CGFloat = 12, bottom: CGFloat = 2
+    let barsWidth = 4 * barWidth + 3 * gap
+    let word: String?
+    switch icon.mark {
+    case .exclamation: word = "!"
+    case .ellipsis: word = "…"
+    default: word = icon.text
+    }
+    let font = NSFont.systemFont(ofSize: 10, weight: .bold)
+    let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black.withAlphaComponent(alpha)]
+    let wordSize = word.map { ($0 as NSString).size(withAttributes: attributes) } ?? .zero
+    let width = ceil(barsWidth + (word == nil ? 0 : 2.5 + wordSize.width)) + 1
+    let image = NSImage(size: NSSize(width: width, height: 16), flipped: false) { _ in
+        guard let context = NSGraphicsContext.current?.cgContext else { return false }
+        for i in 0..<4 {
+            let barHeight = height * CGFloat(i + 1) / 4
+            let rect = NSRect(x: 0.5 + CGFloat(i) * (barWidth + gap), y: bottom, width: barWidth, height: barHeight)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 0.8, yRadius: 0.8)
+            switch icon.bars {
+            case .filled(let level):
+                NSColor.black.withAlphaComponent(alpha * (i < level ? 1 : 0.25)).setFill()
+                path.fill()
+            case .outlined:
+                NSColor.black.withAlphaComponent(alpha * 0.6).setStroke()
+                let inset = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 0.6, yRadius: 0.6)
+                inset.lineWidth = 1
+                inset.stroke()
+            }
+        }
+        if icon.mark == .slash {
+            // A gap cleared along the slash first, so it reads over filled bars.
+            let from = NSPoint(x: 0, y: bottom - 0.5), to = NSPoint(x: barsWidth + 1, y: bottom + height + 0.5)
+            context.saveGState()
+            context.setBlendMode(.clear)
+            let gapLine = NSBezierPath()
+            gapLine.move(to: from)
+            gapLine.line(to: to)
+            gapLine.lineWidth = 3.5
+            gapLine.stroke()
+            context.restoreGState()
+            NSColor.black.withAlphaComponent(alpha).setStroke()
+            let line = NSBezierPath()
+            line.move(to: from)
+            line.line(to: to)
+            line.lineWidth = 1.5
+            line.lineCapStyle = .round
+            line.stroke()
+        }
+        if let word {
+            (word as NSString).draw(at: NSPoint(x: barsWidth + 2.5, y: bottom - 1.5), withAttributes: attributes)
+        }
+        return true
+    }
+    image.isTemplate = true
+    return image
 }
 
 /// The panel, 290 pt wide: a compact version of the Overview's hero. The pill says Connected only while the
@@ -51,13 +140,18 @@ struct MenuBarPanel: View {
     // pressed while a send or a change runs says why RMNet has not quit yet.
     @ObservedObject var quitNotice: SmsQuitNotice
     @ObservedObject var modemQuitNotice: ModemQuitNotice
+    // How many messages are unread (the window's marks, kept up to date by the background check for new messages).
+    @ObservedObject var unread: SmsUnreadNotice
     /// Shows the RMNet window, given the panel's own way of opening it (for when it is not open). The app
     /// passes AppDelegate.showStatusWindow, which brings an open window forward first.
     var showWindow: (_ open: @escaping () -> Void) -> Void = { open in
         open()
         NSApp.activate()
     }
+    /// Asks the window for the Messages screen (WindowRouter), before showWindow opens it.
+    var showMessages: () -> Void = {}
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     private static let width: CGFloat = 290
     private static let inset: CGFloat = 14
@@ -77,6 +171,27 @@ struct MenuBarPanel: View {
             if let ipv4 {
                 KeyValueRow(label: "IPv4", value: ipv4, copyable: true)
             }
+            if unread.count > 0 || unread.onModem > 0 {
+                Button {
+                    showMessages()
+                    let open = openWindow
+                    showWindow { open(id: "status") }
+                } label: {
+                    HStack(spacing: Spacing.s) {
+                        Image(systemName: "envelope.badge.fill")
+                            .foregroundStyle(.blue)
+                        Text(verbatim: unreadLine(unread.count, onModem: unread.onModem))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: Spacing.s)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open Messages")
+            }
             let quitLines = quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line)
             if quitLines.isEmpty {
                 Divider()
@@ -91,6 +206,14 @@ struct MenuBarPanel: View {
                     showWindow { open(id: "status") }
                 }
                 Spacer()
+                Button {
+                    openSettings()
+                    NSApp.activate()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+                .accessibilityLabel(Text("Settings…"))
                 // Through applicationShouldTerminate, so the quit gate still waits for a running send or change.
                 Button("Quit RMNet") { NSApp.terminate(nil) }
             }

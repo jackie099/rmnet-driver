@@ -1,0 +1,13 @@
+{
+  "fill" : { "automatic-gradient" : "extended-srgb:0.49412,0.51765,0.54902,1.00000" },
+  "groups" : [
+    { "name" : "LED", "layers" : [ { "image-name" : "led.svg", "name" : "led" } ],
+      "shadow" : { "kind" : "layer-color", "opacity" : 0.6 }, "translucency" : { "enabled" : false, "value" : 0 }, "specular" : true },
+    { "name" : "Grille", "layers" : [ { "image-name" : "grille.svg", "name" : "grille" } ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.3 }, "translucency" : { "enabled" : true, "value" : 0.2 }, "specular" : true },
+    { "name" : "Body", "layers" : [ { "image-name" : "body.svg", "name" : "body" } ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.5 }, "translucency" : { "enabled" : true, "value" : 0.35 }, "specular" : true },
+    { "name" : "Background", "layers" : [ { "image-name" : "bg.png", "name" : "bg", "glass" : false } ], "shadow" : { "kind" : "none", "opacity" : 0 }, "translucency" : { "enabled" : false, "value" : 0 }, "specular" : false }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}

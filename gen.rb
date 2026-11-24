@@ -146,6 +146,25 @@ sources('app/*.swift').each do |path|
 end
 agrp.new_reference('Host.entitlements')
 
+# The app's icon, once there is one: an Icon Composer document saved as app/AppIcon.icon, or the PNGs in
+# app/Assets.xcassets/AppIcon.appiconset (scripts/make-app-icon.sh makes them from one 1024 x 1024 PNG). Without
+# either the app has no icon of its own (the system's generic one) and the project is as it was without this.
+icon_document = File.directory?(File.join(ROOT, 'app/AppIcon.icon'))
+icon_pngs = !Dir.glob('app/Assets.xcassets/AppIcon.appiconset/*.png', base: ROOT).empty?
+if icon_document || icon_pngs
+  resources = proj.new(Obj::PBXResourcesBuildPhase)
+  app.build_phases << resources
+  ref = if icon_document
+          r = agrp.new_reference('AppIcon.icon')
+          r.last_known_file_type = 'folder.iconcomposer.icon'
+          r
+        else
+          agrp.new_reference('Assets.xcassets')
+        end
+  resources.add_file_reference(ref)
+  app.build_configurations.each { |c| c.build_settings['ASSETCATALOG_COMPILER_APPICON_NAME'] = 'AppIcon' }
+end
+
 embed = proj.new(Obj::PBXCopyFilesBuildPhase)
 embed.name = 'Embed System Extensions'
 embed.dst_subfolder_spec = '16'

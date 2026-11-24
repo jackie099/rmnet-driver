@@ -37,6 +37,10 @@ func expectPart(_ hex: String, _ name: String, sender: String, text: String, tim
     check(p.concat == concat, "\(name): concatenation", "want \(String(describing: concat)), got \(String(describing: p.concat))")
 }
 
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
 func expectUnreadable(_ hex: String, _ name: String) {
     let p = decode(hex, index: 4, status: .unread)
     check(!p.readable && p.sender == "" && p.text == "" && p.timestamp == nil && p.concat == nil
@@ -498,8 +502,12 @@ struct SmsModelTests {
         // 0B 91 7238880900F1 recipient; two time stamps; 00 status.
         expectUnreadable("00" + "06" + "05" + "0B917238880900F1" + "99309251619580" + "99309251619580" + "00",
                          "status report (TP-MTI 2)")
-        // SMS-SUBMIT read as a stored entry (TP-MTI 1) is not a received message.
-        expectUnreadable("0001000B917238880900F100000AE8329BFD4697D9EC37", "SMS-SUBMIT (TP-MTI 1)")
+        // SMS-SUBMIT stored to send (TP-MTI 1, AT+CMGW): its recipient and text, no time. 00 SMSC; 01 SUBMIT; 00 TP-MR;
+        // 0B 91 2120550521F3 recipient +12025550123 (made up); 00 PID; 00 DCS; 0A septets "hellohello".
+        let stored = decode("0001000B912120550521F300000AE8329BFD4697D9EC37", index: 4, status: .sent)
+        check(stored.readable && stored.sender == "+12025550123" && stored.text == "hellohello" && stored.timestamp == nil
+                && stored.outgoing && stored.status == .sent, "SMS-SUBMIT stored: recipient and text", "\(stored)")
+        check(!decode(classic, index: 1, status: .read).outgoing, "a received part is not outgoing")
         // The classic vector with DCS 0C: group 00xx, alphabet bits 11 = reserved.
         expectUnreadable("07917283010010F5040BC87238880900F1000C993092516195800AE8329BFD4697D9EC37",
                          "reserved alphabet")
@@ -805,7 +813,207 @@ struct SmsModelTests {
         check(parseStorage(["OK"]) == nil && parseStorage([]) == nil, "parseStorage: no +CPMS line")
 
         windowHelperChecks()
+        readingPaneHelpers()
+        storedSending()
+        mmsNotificationsAndUnblock()
 
         print("sms-test: \(checks) checks passed")
+    }
+
+    /// The list's heading and the reading pane's Copy Code.
+    static func readingPaneHelpers() {
+        check(messageCountLine(count: 0, unread: 0) == "", "count line: none")
+        check(messageCountLine(count: 1, unread: 0) == "1 message", "count line: one")
+        check(messageCountLine(count: 3, unread: 1) == "3 messages · 1 unread", "count line: with unread")
+
+        let found: [(String, String)] = [
+            ("Your verification code is 482913. It expires in 10 minutes.", "482913"),
+            ("Code 1234", "1234"),
+            ("\u{9A8C}\u{8BC1}\u{7801}\u{FF1A}384920\u{FF0C}5\u{5206}\u{949F}\u{5185}\u{6709}\u{6548}\u{3002}", "384920"),  // a Chinese code message, as escapes
+            ("Your OTP: 00112233", "00112233"),
+            ("G-482913 is your Google verification code.", "482913"),
+        ]
+        for (text, code) in found {
+            check(verificationCode(in: text) == code, "code: \(text)", "got \(String(describing: verificationCode(in: text)))")
+        }
+        let none = [
+            "T-Mobile: You have used 75% of your high-speed data for this bill cycle.",   // no code word
+            "Running late, see you at the station around six.",
+            "Your code is 1234, reference 5678.",                                           // two groups
+            "Call +12025550123 about your code.",                                           // a phone number
+            "Pay $1500 with code word",                                                     // an amount
+            "Your balance 1234.56; PIN unchanged",                                          // a decimal
+            "Your code is 123.",                                                            // too short
+            "Order #123456 code",                                                           // an order number
+            "Call 555-1234 for a new PIN",                                                  // a phone number
+        ]
+        for text in none {
+            check(verificationCode(in: text) == nil, "no code: \(text)", "got \(String(describing: verificationCode(in: text)))")
+        }
+    }
+
+    /// Messages RMNet stored to send: the listing with every status, their box, multi-part sent messages with an unsent
+    /// part, and the answers of AT+CMGW, AT+CMSS, AT+CMGR and AT+CPMS's storage names.
+    static func storedSending() {
+        // A sent and an unsent message among received ones; the same text sent to the same number as two parts.
+        guard case .success(let pdus) = encodeSubmit(to: "+12025550100", text: String(repeating: "made-up ", count: 25),
+                                                     reference: 7), pdus.count == 2,
+              case .success(let one) = encodeSubmit(to: "+12025550199", text: "Made-up reply", reference: 1) else {
+            check(false, "stored: the PDUs encode")
+            return
+        }
+        // A received one: 00 SMSC; 04 DELIVER; 0B 91 2120550521F0 sender +12025550120 (made up); 00 PID; 00 DCS;
+        // 62112201000000 2026-11-22 10:00:00 +00; 0A septets "hellohello".
+        let delivered = "0004" + "0B912120550521F0" + "0000" + "62112201000000" + "0AE8329BFD4697D9EC37"
+        let lines = ["+CMGL: 0,1,,\(delivered.count / 2 - 1)", delivered,
+                     "+CMGL: 1,3,,\(one[0].tpduLength)", one[0].hex,
+                     "+CMGL: 2,3,,\(pdus[0].tpduLength)", pdus[0].hex,
+                     "+CMGL: 3,2,,\(pdus[1].tpduLength)", pdus[1].hex,
+                     "+CMGL: 4,2,,\(one[0].tpduLength)", one[0].hex]
+        let parsed = parseListing(lines)
+        equal(parsed.map { $0.status }, [.read, .sent, .sent, .unsent, .unsent], "stored: the statuses listed")
+        let messages = assemble(parsed.map(decodePart))
+        equal(messages.count, 4, "stored: received, sent, a two-part message, and an unsent one")
+        let received = messages.first { $0.indices == [0] }
+        check(received?.box == .received && received?.outgoing == false && received?.sender == "+12025550120",
+              "stored: received")
+        let sent = messages.first { $0.indices == [1] }
+        check(sent?.box == .sent && sent?.sender == "+12025550199" && sent?.text == "Made-up reply" && sent?.unread == false
+                && sent?.timestamp == nil && sent?.unsentIndices == [], "stored: sent", "\(String(describing: sent))")
+        let twoParts = messages.first { $0.indices == [2, 3] }
+        check(twoParts?.box == .unsent && twoParts?.unsentIndices == [3] && twoParts?.missingParts == 0
+                && twoParts?.text == String(repeating: "made-up ", count: 25), "stored: two parts, one unsent",
+              "\(String(describing: twoParts))")
+        let unsent = messages.first { $0.indices == [4] }
+        check(unsent?.box == .unsent && unsent?.unsentIndices == [4] && unsent?.unread == false, "stored: unsent")
+        // A sent part and a received part with the same key never merge.
+        check(messages.allSatisfy { m in m.box == .received || m.sender != "+12025550120" }, "stored: directions kept apart")
+
+        check(parseStoreIndex(["+CMGW: 5"]) == 5 && parseStoreIndex(["OK"]) == nil && parseStoreIndex(["+CMGW: x"]) == nil,
+              "parse: +CMGW")
+        check(parseStoredSendReference(["+CMSS: 12"]) == 12 && parseStoredSendReference(["+CMSS: 12,\"0011\""]) == 12
+                && parseStoredSendReference(["+CMSS: 300"]) == nil && parseStoredSendReference([]) == nil, "parse: +CMSS")
+        let read = parseReadEntry(["+CMGR: 2,,23", one[0].hex])
+        check(read?.status == .unsent && read?.hex == one[0].hex, "parse: +CMGR status and PDU")
+        check(parseReadEntry(["+CMGR: 3,,23"]) == nil, "parse: +CMGR without its PDU")
+        let names = parseStorageNames(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])
+        check(names?.read == "ME" && names?.write == "ME", "parse: CPMS names")
+        let mixed = parseStorageNames(["+CPMS: \"SM\",0,50,\"ME\",3,255,\"ME\",3,255"])
+        check(mixed?.read == "SM" && mixed?.write == "ME", "parse: CPMS names that differ")
+        check(parseStorageNames(["+CPMS: 3,255,3,255,3,255"]) == nil, "parse: CPMS without names")
+
+        // `sms list`: sent and unsent messages listed with their recipient; JSON's added status, the other keys kept.
+        let listing = SmsListing(messages: messages, used: 5, total: 255)
+        let printed = smsListLines(listing, time: { _ in "2026-11-22 10:00:00" })
+        check(printed.contains("[1] sent to +12025550199 no time") && printed.contains("[2,3] unsent to +12025550100 no time")
+                && printed.contains("[4] unsent to +12025550199 no time")
+                && printed.contains("[0] read +12025550120 2026-11-22 10:00:00"),
+              "sms list: the lines", printed.joined(separator: " | "))
+        let json = smsListJSON(messages, time: { _ in "t" })
+        check(JSONSerialization.isValidJSONObject(json), "sms list --json: valid")
+        let sentJSON = json.first { ($0["indices"] as? [Int]) == [1] }
+        equal(sentJSON?["status"] as? String, "sent", "sms list --json: status sent")
+        check(sentJSON?["time"] is NSNull && sentJSON?["sender"] as? String == "+12025550199", "sms list --json: no time, the recipient")
+        equal(json.first { ($0["indices"] as? [Int]) == [0] }?["status"] as? String, "received", "sms list --json: status received")
+        equal(Set(sentJSON?.keys.map { $0 } ?? []),
+              ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status", "notConfirmed"],
+              "sms list --json: the keys (notConfirmed added)")
+    }
+
+    /// WAP Push MMS notifications (single-part and multi-part) and `sms unblock` parsing and output.
+    static func mmsNotificationsAndUnblock() {
+        func hexBytes(_ bytes: [UInt8]) -> String {
+            bytes.map { String(format: "%02X", $0) }.joined()
+        }
+        func deliverWapPush(outerSenderHex: String = "04813200", udh: [UInt8], payload: [UInt8],
+                            timeHex: String = "62112201510000") -> String {
+            let ud = udh + payload
+            return "0044" + outerSenderHex + "0004" + timeHex + String(format: "%02X", ud.count) + hexBytes(ud)
+        }
+
+        let portUdh: [UInt8] = [0x06, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let wspHead: [UInt8] = [0x01, 0x06, 0x03, 0xBE, 0xAF, 0x84]
+
+        // 1. Single-part MMS notification with address-present token (0x80) and PLMN suffix.
+        let fromPlmn = [UInt8(0x80)] + Array("12025550144/TYPE=PLMN".utf8) + [0x00]
+        let mmsBody1: [UInt8] = [0x8C, 0x82, 0x98] + Array("tx1".utf8) + [0x00, 0x8D, 0x90,
+                                 0x89, UInt8(fromPlmn.count)] + fromPlmn
+            + [0x83] + Array("http://mmsc.example.invalid/m1".utf8) + [0x00]
+        let singleHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBody1)
+        let singleMsg = assemble([decodePart(StoredPdu(index: 7, status: .unread, hex: singleHex))])
+        equal(singleMsg.count, 1, "mms single: one message")
+        check(singleMsg.first?.readable == true && singleMsg.first?.unread == true
+                && singleMsg.first?.sender == "12025550144"
+                && singleMsg.first?.text == mmsNotificationText && singleMsg.first?.timestamp != nil,
+              "mms single: decoded sender, text and time", "\(String(describing: singleMsg.first))")
+
+        // 2. MMS From encoded with Value-length + Well-known-charset UTF-8 (0xEA).
+        let utf8Addr = [UInt8(0xEA)] + Array("+12025550177/TYPE=PLMN".utf8) + [0x00]
+        let fromCharset = [UInt8(0x80), UInt8(utf8Addr.count)] + utf8Addr
+        let mmsBody2: [UInt8] = [0x8C, 0x82, 0x8D, 0x90, 0x89, UInt8(fromCharset.count)] + fromCharset
+        let charsetHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBody2)
+        let charsetMsg = assemble([decodePart(StoredPdu(index: 8, status: .unread, hex: charsetHex))])
+        equal(charsetMsg.first?.sender, "+12025550177", "mms charset From: sender")
+
+        // 3. Insert-address-token (0x81) in From falls back to the outer TP-OA ("2300").
+        let mmsBodyAnon: [UInt8] = [0x8C, 0x82, 0x8D, 0x90, 0x89, 0x01, 0x81]
+        let anonHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBodyAnon)
+        let anonMsg = assemble([decodePart(StoredPdu(index: 9, status: .unread, hex: anonHex))])
+        check(anonMsg.first?.sender == "2300" && anonMsg.first?.text == mmsNotificationText,
+              "mms anonymous From: outer sender kept", "\(String(describing: anonMsg.first))")
+
+        // 4. Non-MMS WAP Push on port 2948 (for example text/vnd.wap.si, 0xB5) stays unreadable.
+        let nonMmsHex = deliverWapPush(udh: portUdh, payload: [0x01, 0x06, 0x01, 0xB5, 0x02, 0x05, 0x6A, 0x00])
+        let nonMmsMsg = assemble([decodePart(StoredPdu(index: 12, status: .unread, hex: nonMmsHex))])
+        check(nonMmsMsg.first?.readable == false, "non-MMS WAP Push: not readable")
+
+        // 5. Two-part concatenated WAP Push MMS notification reassembles across parts 1 and 2.
+        let fullPush = wspHead + mmsBody2
+        let splitAt = fullPush.count / 2
+        let concatUdh1: [UInt8] = [0x0B, 0x00, 0x03, 0x42, 0x02, 0x01, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let concatUdh2: [UInt8] = [0x0B, 0x00, 0x03, 0x42, 0x02, 0x02, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let part1 = StoredPdu(index: 10, status: .unread,
+                              hex: deliverWapPush(udh: concatUdh1, payload: Array(fullPush[..<splitAt])))
+        let part2 = StoredPdu(index: 11, status: .unread,
+                              hex: deliverWapPush(udh: concatUdh2, payload: Array(fullPush[splitAt...])))
+        let joined = assemble([decodePart(part2), decodePart(part1)])
+        equal(joined.count, 1, "mms two-part: assembled into one message")
+        check(joined.first?.indices == [10, 11] && joined.first?.missingParts == 0
+                && joined.first?.sender == "+12025550177" && joined.first?.text == mmsNotificationText,
+              "mms two-part: indices, sender and text", "\(String(describing: joined.first))")
+
+        // 6. parseCnmi, parseSms("unblock"), assembleUnblocked, sentences and JSON.
+        check(parseCnmi(["+CNMI: 2,1,0,0,0", "OK"])?.mode == 2 && parseCnmi(["+CNMI: 2,1,0,0,0"])?.mt == 1,
+              "parseCnmi: 2,1")
+        check(parseCnmi(["+CNMI: 2,2,0,0,0"])?.mt == 2 && parseCnmi(["OK"]) == nil && parseCnmi(["+CNMI: x,1"]) == nil,
+              "parseCnmi: 2,2 and invalid")
+
+        equal(parseSms(["unblock"]), .unblock(seconds: 95, json: false), "parseSms: unblock default")
+        equal(parseSms(["unblock", "--json"]), .unblock(seconds: 95, json: true), "parseSms: unblock --json")
+        equal(parseSms(["unblock", "30", "--json"]), .unblock(seconds: 30, json: true), "parseSms: unblock 30 --json")
+        equal(parseSms(["unblock", "--json", "180"]), .unblock(seconds: 180, json: true), "parseSms: unblock --json 180")
+        check(parseSms(["unblock", "0"]) == nil && parseSms(["unblock", "181"]) == nil
+                && parseSms(["unblock", "--json", "--json"]) == nil && parseSms(["unblock", "10", "20"]) == nil,
+              "parseSms: unblock wrong usage")
+
+        let ordinaryHex = "0004" + "0B912120550561F1" + "0000" + "62112201610000" + "02C834"
+        let unblocked = assembleUnblocked([StoredPdu(index: 7, status: .unread, hex: singleHex),
+                                           StoredPdu(index: 8, status: .unread, hex: ordinaryHex)], restoredCnmi: false)
+        check(unblocked.stored == 2 && unblocked.mmsNotifications == 1 && unblocked.indices == [7, 8]
+                && unblocked.messages.allSatisfy { $0.unread }, "assembleUnblocked: counts and unread")
+        equal(smsUnblockSentence(unblocked), "Unblocked incoming messages: stored 2 part(s) (1 MMS notification).",
+              "smsUnblockSentence: stored with MMS")
+        let quietHealed = assembleUnblocked([], restoredCnmi: true)
+        equal(smsUnblockSentence(quietHealed),
+              "Restored incoming message storage (AT+CNMI=2,1,0,0,0); no queued messages arrived.",
+              "smsUnblockSentence: healed CNMI")
+        let cliLines = smsUnblockLines(unblocked, seconds: 75, time: { _ in "2026-11-22 10:15:00" })
+        check(cliLines.first == "sms: unblocked: stored 2 part(s), 2 message(s) (1 MMS notification)"
+                && cliLines.contains("  \(mmsNotificationText)"), "smsUnblockLines: summary and MMS text",
+              cliLines.joined(separator: " | "))
+        let ujson = smsUnblockJSON(unblocked, time: { _ in "2026-11-22T10:15:00Z" })
+        check(JSONSerialization.isValidJSONObject(ujson) && ujson["storedParts"] as? Int == 2
+                && ujson["mmsNotifications"] as? Int == 1 && ujson["indices"] as? [Int] == [7, 8]
+                && ujson["restoredCnmi"] as? Bool == false, "smsUnblockJSON: valid and keys")
     }
 }

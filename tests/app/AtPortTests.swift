@@ -212,6 +212,46 @@ struct AtPortTests {
                     [.probeAgain, .probeAgain, .settled(echoes: true)],
                     "the modem's OK to the ESC, read as a silent answer, does not settle on no echo")
 
+        // --- unsolicited blocked +CMTI and +CMT deliveries (AtUnsolicitedReader) ------------------
+        let cmtHex = "07912120550501F0040B912120550561F400006211223202000A05C8329BFD06" // 8 SMSC + 24 TPDU octets
+        let mmsHex = "07912120550501F04404C9320000046211223202000A140605040B8423F0010601BE8C82987478008D90" // 8 SMSC + 34 TPDU octets
+        for (how, chunks) in chunkings(Array(("\r\n+CMTI: ,3\r\n\r\n+CMTI: ,-1\r\n").utf8)) {
+            var r = AtUnsolicitedReader()
+            for chunk in chunks { r.feed(chunk) }
+            check(r.takeBlockedFlag(), "unsolicited: +CMTI without storage marks blocked (\(how))")
+            check(!r.takeBlockedFlag(), "unsolicited: takeBlockedFlag clears it (\(how))")
+        }
+        check(AtUnsolicitedReader.isBlockedCmti("+CMTI: ,3")
+              && AtUnsolicitedReader.isBlockedCmti("+CMTI: ,-1")
+              && AtUnsolicitedReader.isBlockedCmti("+CMTI: \"\",3")
+              && AtUnsolicitedReader.isBlockedCmti("+CMTI: \"ME\",-1")
+              && !AtUnsolicitedReader.isBlockedCmti("+CMTI: \"ME\",0")
+              && !AtUnsolicitedReader.isBlockedCmti("+CMTI: \"SM\",29")
+              && !AtUnsolicitedReader.isBlockedCmti("+CMTI: garbage"),
+              "isBlockedCmti: empty storage or negative index only")
+
+        let stream = "\r\n+CMT: ,34\r\n\(mmsHex)\r\n\r\n+CMT: \"Alerts, US\",24\r\n^RSSI: 12\r\n\(cmtHex)\r\n"
+        for (how, chunks) in chunkings(Array(stream.utf8)) {
+            var r = AtUnsolicitedReader()
+            for chunk in chunks { r.feed(chunk) }
+            let got = r.takeDeliveries()
+            check(got == [AtDeliveredPdu(tpduLength: 34, hex: mmsHex), AtDeliveredPdu(tpduLength: 24, hex: cmtHex)],
+                  "unsolicited: two +CMT deliveries, alpha with comma and stray URC skipped (\(how))", "\(got)")
+            check(r.takeDeliveries().isEmpty && !r.waitingForHex, "unsolicited: cleared after take (\(how))")
+        }
+        // Wrong length or OK before hex drops the incomplete +CMT header without taking a later PDU.
+        var mismatch = AtUnsolicitedReader()
+        mismatch.feed(Array("\r\n+CMT: ,99\r\n\(cmtHex)\r\nOK\r\n".utf8))
+        check(mismatch.takeDeliveries().isEmpty && !mismatch.waitingForHex,
+              "unsolicited: mismatched TPDU length is rejected")
+
+        _ = AtPort.takeRescuedDeliveries()
+        check(!AtPort.hasRescuedDeliveries, "rescued: empty at start")
+        AtPort.keepRescuedDeliveries([AtDeliveredPdu(tpduLength: 24, hex: cmtHex)])
+        check(AtPort.hasRescuedDeliveries, "rescued: recorded")
+        check(AtPort.takeRescuedDeliveries() == [AtDeliveredPdu(tpduLength: 24, hex: cmtHex)]
+              && !AtPort.hasRescuedDeliveries, "rescued: taken once")
+
         print("at-test: \(checks) checks passed")
     }
 }

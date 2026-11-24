@@ -169,6 +169,11 @@ struct MenuBarStatusTests {
         networkLines()
         asOf()
         readInfo()
+        iconStyle()
+        signalModel()
+        signalIcons()
+        signalPolling()
+        pulseSignal()
         print("menu bar status: \(checks) checks passed")
     }
 
@@ -767,5 +772,267 @@ struct MenuBarStatusTests {
         rig.open()
         equal(s.info, saInfo, "info: set again by a read that succeeded")
         equal(rig.network.calls, 7, "info: one read per opening, not within 10 s")
+    }
+
+    // MARK: The signal bars
+
+    /// The style is kept in the user defaults under menuBarIconStyle; unset or unknown reads as the antenna.
+    static func iconStyle() {
+        let suite = "io.rmnetdriver.RMNet.tests.\(getpid())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preference = MenuBarIconPreference(defaults: defaults)
+        equal(preference.load(), .antenna, "style: unset is the antenna")
+        preference.save(.signal)
+        equal(defaults.string(forKey: "menuBarIconStyle"), "signal", "style: kept under menuBarIconStyle")
+        equal(preference.load(), .signal, "style: read back")
+        defaults.set("rainbow", forKey: "menuBarIconStyle")
+        equal(preference.load(), .antenna, "style: an unknown value is the antenna")
+        equal(MenuBarIconStyle.allCases.map { $0.title }, ["Antenna", "Signal bars"], "style: titles")
+        check(preference.loadShowsTechnology(), "technology: unset shows it")
+        preference.saveShowsTechnology(false)
+        equal(defaults.object(forKey: "menuBarShowsTechnology") as? Bool, false, "technology: kept under menuBarShowsTechnology")
+        check(!preference.loadShowsTechnology(), "technology: read back off")
+        defaults.set("maybe", forKey: "menuBarShowsTechnology")
+        check(preference.loadShowsTechnology(), "technology: a value not a Bool shows it")
+
+        // The model reads it at once, and setIconStyle keeps it.
+        preference.save(.signal)
+        let s = MenuBarStatus(properties: { nil }, modem: { (.absent, nil) }, listing: { $0([]) },
+                              network: { .failure(ModemFailure(message: "x")) }, queue: DispatchQueue(label: queueName),
+                              preference: preference)
+        equal(s.iconStyle, .signal, "style: read when the model is made")
+        s.setIconStyle(.antenna)
+        equal(s.iconStyle, .antenna, "style: set")
+        equal(preference.load(), .antenna, "style: set is kept")
+        preference.saveShowsTechnology(false)
+        let off = MenuBarStatus(properties: { nil }, modem: { (.absent, nil) }, listing: { $0([]) },
+                                network: { .failure(ModemFailure(message: "x")) }, queue: DispatchQueue(label: queueName),
+                                preference: preference)
+        check(!off.showsTechnology, "technology: read when the model is made")
+        off.setShowsTechnology(true)
+        check(off.showsTechnology && preference.loadShowsTechnology(), "technology: set and kept")
+        let none = MenuBarStatus(properties: { nil }, modem: { (.absent, nil) }, listing: { $0([]) },
+                                 network: { .failure(ModemFailure(message: "x")) }, queue: DispatchQueue(label: queueName))
+        equal(none.iconStyle, .antenna, "style: without a preference, the antenna")
+    }
+
+    /// What a read gives the bars, which command comes next, and what a failure keeps.
+    static func signalModel() {
+        let t = Date(timeIntervalSince1970: 1_800_000_000)
+        func serving(_ state: String, _ legs: [CellLeg]) -> NetworkInfo {
+            NetworkInfo(serving: ServingCell(state: state, cells: legs))
+        }
+        let sa = serving("NOCONN", [leg("NR5G-SA", band: "n41", rsrp: -86, sinr: 10)])
+        equal(menuBarSignal(from: sa, at: t), MenuBarSignal(level: 3, technology: "5G", service: .normal, at: t),
+              "signal: 5G SA from the serving cell alone")
+        let lte = serving("CONNECT", [leg("LTE", band: "B3", rsrp: -112, sinr: 2)])
+        equal(menuBarSignal(from: lte, at: t), MenuBarSignal(level: 0, technology: "LTE", service: .normal, at: t),
+              "signal: LTE, no bars")
+        let endc = serving("CONNECT", [leg("LTE", band: "B3", rsrp: -95, sinr: 8), leg("NR5G-NSA", band: "n78", rsrp: -80, sinr: 20)])
+        equal(menuBarSignal(from: endc, at: t).technology, "5G", "signal: EN-DC is 5G")
+        equal(menuBarSignal(from: serving("SEARCH", []), at: t),
+              MenuBarSignal(level: 0, technology: nil, service: .searching, at: t), "signal: searching")
+        equal(menuBarSignal(from: serving("LIMSRV", []), at: t).service, .searching, "signal: limited service")
+        equal(menuBarSignal(from: serving("NOCONN", []), at: t).service, .searching, "signal: no leg")
+        equal(menuBarSignal(from: NetworkInfo(radio: .airplane), at: t),
+              MenuBarSignal(level: 0, technology: nil, service: .radioOff, at: t), "signal: airplane mode")
+        equal(menuBarSignal(from: NetworkInfo(radio: .minimum), at: t).service, .radioOff, "signal: minimum functionality")
+        equal(menuBarSignal(from: NetworkInfo(radio: .on), at: t),
+              MenuBarSignal(level: 0, technology: nil, service: .searching, at: t), "signal: a radio read that says on")
+        equal(menuBarSignal(from: NetworkInfo(), at: t),
+              MenuBarSignal(level: nil, technology: nil, service: .normal, at: t), "signal: nothing read")
+        let unknownRsrp = serving("NOCONN", [leg("NR5G-SA", band: "n41", rsrp: nil, sinr: nil)])
+        equal(menuBarSignal(from: unknownRsrp, at: t).level, nil, "signal: a leg without RSRP is not known")
+        equal(menuBarSignal(from: saInfo, at: t).level, 3, "signal: a full read")
+
+        // One command a read: the serving cell, the radio while it is off, both in turn while searching.
+        let normal = MenuBarSignal(level: 3, technology: "5G", service: .normal, at: t)
+        let searching = MenuBarSignal(level: 0, technology: nil, service: .searching, at: t)
+        let off = MenuBarSignal(level: 0, technology: nil, service: .radioOff, at: t)
+        equal(nextSignalQuery(previous: nil, lastQuery: nil), .servingCell, "query: first")
+        equal(nextSignalQuery(previous: normal, lastQuery: .servingCell), .servingCell, "query: with service")
+        equal(nextSignalQuery(previous: off, lastQuery: .radio), .radio, "query: radio off")
+        equal(nextSignalQuery(previous: searching, lastQuery: .servingCell), .radio, "query: searching, then the radio")
+        equal(nextSignalQuery(previous: searching, lastQuery: .radio), .servingCell, "query: searching, then the cell")
+
+        // A busy port or no answer keeps the level, stale; the modem gone clears it.
+        var stale = normal
+        stale.stale = true
+        equal(menuBarSignal(after: ModemFailure(message: describe(AtError.busy)), previous: normal), stale, "failure: busy keeps")
+        equal(menuBarSignal(after: ModemFailure(message: "No answer in 3 s."), previous: normal), stale, "failure: timeout keeps")
+        check(menuBarSignal(after: ModemFailure(message: describe(AtError.modemNotAttached)), previous: normal) == nil,
+              "failure: the modem gone clears")
+        check(menuBarSignal(after: ModemFailure(message: describe(AtError.busy)), previous: nil) == nil,
+              "failure: nothing to keep")
+    }
+
+    /// The icon for each state: every one told apart, and the antenna's label first in what VoiceOver says.
+    static func signalIcons() {
+        let t = Date(timeIntervalSince1970: 1_800_000_000)
+        let good = MenuBarSignal(level: 3, technology: "5G", service: .normal, at: t)
+        equal(menuBarSignalIcon(.up, good, now: t),
+              MenuBarSignalIcon(bars: .filled(3), text: "5G", accessibilityLabel: "RMNet: connected, 3 of 4 bars, 5G"),
+              "icon: connected")
+        equal(menuBarSignalIcon(.down, good, now: t),
+              MenuBarSignalIcon(bars: .filled(3), mark: .slash, accessibilityLabel: "RMNet: not connected, 3 of 4 bars"),
+              "icon: not connected, with signal")
+        equal(menuBarSignalIcon(.noDriver, good, now: t),
+              MenuBarSignalIcon(bars: .outlined, mark: .slash, accessibilityLabel: "RMNet: no driver"), "icon: no driver")
+        equal(menuBarSignalIcon(.waitingForApproval, nil, now: t),
+              MenuBarSignalIcon(bars: .outlined, mark: .exclamation, accessibilityLabel: "RMNet: waiting for approval"),
+              "icon: waiting for approval")
+        equal(menuBarSignalIcon(.down, MenuBarSignal(level: 0, technology: nil, service: .radioOff, at: t), now: t),
+              MenuBarSignalIcon(bars: .filled(0), airplane: true, accessibilityLabel: "RMNet: not connected, radio off"),
+              "icon: radio off")
+        equal(menuBarSignalIcon(.down, MenuBarSignal(level: 0, technology: nil, service: .searching, at: t), now: t),
+              MenuBarSignalIcon(bars: .filled(0), mark: .ellipsis, accessibilityLabel: "RMNet: not connected, searching"),
+              "icon: searching")
+        equal(menuBarSignalIcon(.up, nil, now: t),
+              MenuBarSignalIcon(bars: .outlined, accessibilityLabel: "RMNet: connected, signal not known"),
+              "icon: connected, nothing read yet")
+        equal(menuBarSignalIcon(.down, nil, now: t),
+              MenuBarSignalIcon(bars: .filled(0), mark: .slash, accessibilityLabel: "RMNet: not connected, signal not known"),
+              "icon: not connected, nothing read yet")
+        equal(menuBarSignalIcon(.up, MenuBarSignal(level: nil, technology: "LTE", service: .normal, at: t), now: t),
+              MenuBarSignalIcon(bars: .outlined, text: "LTE", accessibilityLabel: "RMNet: connected, signal not known, LTE"),
+              "icon: connected, level not known")
+
+        var stale = good
+        stale.stale = true
+        let dimmed = menuBarSignalIcon(.up, stale, now: t)
+        check(dimmed.dimmed && dimmed.bars == .filled(3), "icon: stale keeps its bars, dimmed")
+        equal(dimmed.accessibilityLabel, "RMNet: connected, 3 of 4 bars, 5G, not current", "icon: stale is said")
+        check(!menuBarSignalIcon(.up, good, now: t.addingTimeInterval(44)).dimmed, "icon: 44 s old is current")
+        check(menuBarSignalIcon(.up, good, now: t.addingTimeInterval(46)).dimmed, "icon: 46 s old is dimmed")
+        // Without the technology: the bars alone, and VoiceOver still hears it.
+        equal(menuBarSignalIcon(.up, good, now: t, showsTechnology: false),
+              MenuBarSignalIcon(bars: .filled(3), text: nil, accessibilityLabel: "RMNet: connected, 3 of 4 bars, 5G"),
+              "icon: connected, technology hidden")
+        equal(menuBarSignalIcon(.waitingForApproval, nil, now: t, showsTechnology: false).mark, .exclamation,
+              "icon: the marks stay without the technology")
+        equal(menuBarSignalIcon(.down, MenuBarSignal(level: 0, technology: nil, service: .searching, at: t), now: t,
+                                showsTechnology: false).mark, .ellipsis, "icon: searching keeps its ellipsis")
+        // The antenna's labels are unchanged.
+        equal(MenuBarIcon.up.accessibilityLabel, "RMNet: connected", "antenna: label kept")
+    }
+
+    /// The reads, all in the background turn (the bars have no timer of their own): only with the bars chosen and the
+    /// driver attached; the window's fresh read instead of one of the bars' own; one command a turn; a busy port, or a
+    /// turn that ended before the bars' command (a timeout on an earlier one), keeps the bars, stale.
+    static func signalPolling() {
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        var properties: DriverProperties? = upProperties
+        var fresh: (info: NetworkInfo, at: Date)? = nil
+        let suite = "io.rmnetdriver.RMNet.tests.poll.\(getpid())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let queue = DispatchQueue(label: queueName)
+        let s = MenuBarStatus(
+            properties: { properties }, modem: { (.qmi(interface: 4), rm520) }, listing: { $0([enabled]) },
+            network: { .success(saInfo) }, now: { clock }, queue: queue,
+            freshInfo: { fresh },
+            preference: MenuBarIconPreference(defaults: defaults))
+        var asked: [[String]] = []
+        // One background turn: the bars' command, if they want one, and the turn's answer to it.
+        func turn(_ answer: (String) -> Result<[String: PulseAnswer], ModemFailure>) {
+            let commands = s.pulseSignalCommands()
+            guard !commands.isEmpty else { return }
+            asked.append(commands)
+            s.pulseSignalAnswers(answer(commands[0]))
+        }
+        func lines(_ l: [String]) -> (String) -> Result<[String: PulseAnswer], ModemFailure> {
+            { command in .success([command: .lines(l)]) }
+        }
+        let sa = "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-86,-10,10,1,-"
+        s.poll()
+
+        // The antenna: no read.
+        turn(lines([sa]))
+        equal(asked.count, 0, "turn: the antenna reads nothing")
+
+        // The bars: the serving cell.
+        s.setIconStyle(.signal)
+        turn(lines([sa]))
+        equal(asked, [["AT+QENG=\"servingcell\""]], "turn: one serving-cell read")
+        equal(s.signal, MenuBarSignal(level: 3, technology: "5G", service: .normal, at: clock), "turn: the bars")
+        equal(s.signalIcon.bars, .filled(3), "turn: drawn")
+        equal(s.signalIcon.text, "5G", "turn: with the technology")
+        s.setShowsTechnology(false)
+        check(s.signalIcon.text == nil && s.signalIcon.bars == .filled(3), "turn: the technology turned off at once")
+        equal(asked.count, 1, "turn: turning it off reads nothing")
+        s.setShowsTechnology(true)
+
+        // A busy port: the bars kept, stale.
+        clock = clock.addingTimeInterval(15)
+        turn { _ in .failure(ModemFailure(message: describe(AtError.busy))) }
+        check(s.signal?.stale == true && s.signal?.level == 3, "turn: busy keeps the level, stale")
+        check(s.signalIcon.dimmed, "turn: busy dims the bars")
+
+        // A turn that ended before the bars' command (another rider's command timed out first): kept, stale.
+        turn(lines([sa]))
+        equal(s.signal?.stale, false, "turn: an answer is current again")
+        turn { _ in .success(["AT+CPMS?": .lines(["+CPMS: \"ME\",1,255,\"ME\",1,255,\"ME\",1,255"])]) }
+        check(s.signal?.stale == true && s.signal?.level == 3, "turn: no answer to the bars' command keeps the level, stale")
+        // A refusal is an answer: the serving cell not known.
+        turn { command in .success([command: .refused("ERROR")]) }
+        check(s.signal?.stale == false && s.signal?.level == nil, "turn: a refusal leaves the level unknown")
+
+        // The window's fresh read stands in: no read of the bars' own; then a fresh success is current.
+        fresh = (saInfo, clock.addingTimeInterval(-3))
+        let before = asked.count
+        turn(lines([sa]))
+        equal(asked.count, before, "turn: the window's fresh read, no port")
+        equal(s.signal?.stale, false, "turn: the fresh read is current")
+        equal(s.signal?.level, 3, "turn: the fresh read's level")
+        fresh = (saInfo, clock.addingTimeInterval(-16))
+        turn(lines(["+QENG: \"servingcell\",\"SEARCH\""]))
+        equal(asked.count, before + 1, "turn: an old window read does not count")
+        equal(s.signal?.service, .searching, "turn: searching")
+
+        // Searching: next the radio, which says it is off.
+        turn(lines(["+CFUN: 4"]))
+        equal(asked.last, ["AT+CFUN?"], "turn: searching asks the radio")
+        check(s.signalIcon.airplane, "turn: an airplane")
+
+        // No driver: no read.
+        properties = nil
+        s.poll()
+        let quiet = asked.count
+        turn(lines([sa]))
+        equal(asked.count, quiet, "turn: no driver, no read")
+        equal(s.signalIcon.mark, .slash, "turn: no driver is struck through")
+
+        // Back to the antenna: turns read nothing.
+        properties = upProperties
+        s.poll()
+        s.setIconStyle(.antenna)
+        turn(lines([sa]))
+        equal(asked.count, quiet, "turn: the antenna again, no read")
+    }
+
+    /// The signal bars ride the background turn: the command they want, then its answers.
+    static func pulseSignal() {
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        let suite = "io.rmnetdriver.RMNet.tests.pulse.\(getpid())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let queue = DispatchQueue(label: queueName)
+        let s = MenuBarStatus(properties: { upProperties }, modem: { (.qmi(interface: 4), rm520) }, listing: { $0([enabled]) },
+                              network: { .success(saInfo) }, now: { clock }, queue: queue,
+                              preference: MenuBarIconPreference(defaults: defaults))
+        s.poll()
+        equal(s.pulseSignalCommands(), [], "pulse: the antenna wants nothing")
+        check(s.modemOnUsb, "pulse: the modem on USB, from the registry")
+        s.setIconStyle(.signal)
+        equal(s.pulseSignalCommands(), ["AT+QENG=\"servingcell\""], "pulse: the serving cell")
+        equal(s.pulseSignalCommands(), [], "pulse: not again while one runs")
+        s.pulseSignalAnswers(.success(["AT+QENG=\"servingcell\"": .lines([
+            "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-86,-10,10,1,-"])]))
+        equal(s.signal?.level, 3, "pulse: the answer read")
+        clock = clock.addingTimeInterval(15)
+        _ = s.pulseSignalCommands()
+        s.pulseSignalAnswers(.failure(ModemFailure(message: describe(AtError.busy))))
+        check(s.signal?.stale == true && s.signal?.level == 3, "pulse: a busy turn keeps the bars, stale")
     }
 }

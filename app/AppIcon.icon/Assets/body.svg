@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" color-interpolation="sRGB">
+  <defs>
+    <linearGradient id="shell" gradientUnits="userSpaceOnUse" x1="292" y1="310" x2="945" y2="1002">
+      <stop offset="0" stop-color="#F4F4F2"/>
+      <stop offset="0.46" stop-color="#EDEDEC"/>
+      <stop offset="1" stop-color="#DADCDD"/>
+    </linearGradient>
+    <linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="220" y1="318" x2="970" y2="990">
+      <stop offset="0" stop-color="#FCFCFB"/>
+      <stop offset="1" stop-color="#F1F2F3"/>
+    </linearGradient>
+    <linearGradient id="switch" >
+      <stop offset="0" stop-color="#ADB2B7"/>
+      <stop offset="0.64" stop-color="#D5D7D9"/>
+      <stop offset="1" stop-color="#C7C9CC"/>
+    </linearGradient>
+    <linearGradient id="recess" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6B7177"/>
+      <stop offset="1" stop-color="#8A9094"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(95.196 65.907) scale(0.670103)">
+    <path d="M153 677 C143 679 137 691 137 706 V795
+    C137 809 143 821 153 823 Z" fill="url(#switch)"/>
+    <path d="M250 318 H1004 C1067 318 1107 360 1107 426 V902
+    C1107 955 1077 990 1026 990 H227 C176 990 146 955 146 902 V426
+    C146 360 187 318 250 318 Z M217 558 H1031 C1058 558 1077 578 1077 604 V915
+    C1077 943 1057 962 1031 962 H218 C192 962 172 942 172 915 V604
+    C172 578 190 558 217 558 Z" fill="url(#rim)" fill-rule="evenodd"/>
+    <path d="M250 321.2 H1004 C1065 321.2 1103.8 361.7 1103.8 426 V902
+    C1103.8 953 1075.4 986.8 1026 986.8 H227
+    C177.6 986.8 149.2 953 149.2 902 V426 C149.2 361.7 189 321.2 250 321.2 Z M217 558 H1031 C1058 558 1077 578 1077 604 V915
+    C1077 943 1057 962 1031 962 H218 C192 962 172 942 172 915 V604
+    C172 578 190 558 217 558 Z" fill="url(#shell)" fill-rule="evenodd"/>
+    <path d="M217 551.2 H1031 C1062.6 551.2 1083.8 574.1 1083.8 604 V915
+    C1083.8 946.7 1060.7 968.8 1031 968.8 H218 C187.3 968.8 165.2 945.7 165.2 915
+    V604 C165.2 573.4 186.4 551.2 217 551.2 Z M217 554 H1031 C1061 554 1081 576 1081 604 V915
+    C1081 945 1059 966 1031 966 H218 C189 966 168 944 168 915 V604
+    C168 575 188 554 217 554 Z" fill="#BEC2C5" fill-rule="evenodd"/>
+    <path d="M217 554 H1031 C1061 554 1081 576 1081 604 V915
+    C1081 945 1059 966 1031 966 H218 C189 966 168 944 168 915 V604
+    C168 575 188 554 217 554 Z M217 558 H1031 C1058 558 1077 578 1077 604 V915
+    C1077 943 1057 962 1031 962 H218 C192 962 172 942 172 915 V604
+    C172 578 190 558 217 558 Z" fill="url(#recess)" fill-rule="evenodd"/>
+    <rect x="902.6" y="385.9" width="137.2" height="32.2" rx="16.1" fill="#D3D8DB"/>
+    <rect x="904.2" y="387.4" width="134" height="29.2" rx="14.6" fill="#F4F6F6"/>
+  </g>
+</svg>

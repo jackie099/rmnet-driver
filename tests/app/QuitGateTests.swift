@@ -3,10 +3,11 @@
 // then the quit lines the window and the menu bar's panel show (quitNoticeLines); then the whole-branch
 // review's case and its neighbours with the real controllers (app/ModemController.swift and
 // app/SmsController.swift) on one serial queue, as in the app, each with a fake service whose calls block
-// until the test releases them, wired to the gate as the app delegate (app/StatusView.swift) wires them.
+// until the test releases them, wired to the gate as the app delegate (app/StatusView.swift) wires them; and
+// the SIM slot watcher (app/SimSlotWatch.swift) switching through the modem controller while the app quits.
 // Built with swiftc by `make app-test` together with app/SmsModel.swift, app/SmsController.swift,
-// app/ModemNetwork.swift, app/ModemSettings.swift and app/ModemController.swift; needs no AppKit, no window
-// and no modem. Stops at the first failure, prints which check failed and exits 1.
+// app/ModemNetwork.swift, app/ModemSettings.swift, app/ModemController.swift and app/SimSlotWatch.swift; needs no
+// AppKit, no window and no modem. Stops at the first failure, prints which check failed and exits 1.
 import Foundation
 
 var checks = 0
@@ -102,10 +103,12 @@ final class FakeSms: SmsServing {
         return .success(indices.count)
     }
 
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> {
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
         calls.enter("send")
-        return calls.locked { sendOutcome }
+        return calls.locked { sendOutcome.map { SmsSent(parts: $0) } }
     }
+
+    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure> { .failure(SmsFailure(message: "not used")) }
 
     func releaseSend(_ outcome: Result<Int, SmsFailure>) {
         calls.locked { sendOutcome = outcome }
@@ -117,6 +120,7 @@ final class FakeModem: ModemServing {
     let calls: Calls
     private var infoOutcome: Result<NetworkInfo, ModemFailure> = .success(NetworkInfo())
     private var radioOutcome: Result<RadioChange, ModemFailure> = .failure(ModemFailure(message: "not set"))
+    private var slotOutcome: Result<SimSlotChange, ModemFailure> = .failure(ModemFailure(message: "not set"))
 
     init(_ calls: Calls) { self.calls = calls }
 
@@ -124,6 +128,8 @@ final class FakeModem: ModemServing {
         calls.enter("networkInfo")
         return calls.locked { infoOutcome }
     }
+
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> { .success([]) }
 
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> {
         calls.enter("setRadio")
@@ -150,6 +156,26 @@ final class FakeModem: ModemServing {
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    func cellLock() -> Result<CellLockState, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failureOr("not used")) }
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> { .failure(failureOr("not used")) }
+    func imei() -> Result<String, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite {
+        ImeiWrite(outcome: .failure(ModemFailure(message: "not used")))
+    }
+    func simSlot() -> Result<Int, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
+        calls.enter("setSimSlot \(slot)")
+        return calls.locked { slotOutcome }
+    }
+
+    func releaseSlot(_ outcome: Result<SimSlotChange, ModemFailure>) {
+        calls.locked { slotOutcome = outcome }
+        calls.release()
+    }
+    private func failureOr(_ s: String) -> ModemFailure { ModemFailure(message: s) }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {
         calls.locked { infoOutcome = outcome }
@@ -184,6 +210,24 @@ final class App {
          QuitGate.Member(quitWhenFinished: { [unowned self] in self.messages.quitWhenFinished() },
                          resume: { [unowned self] in self.messages.resumeAfterCancelledQuit() })],
         reply: { [unowned self] in self.replies.append($0) })
+
+    /// The SIM slot watcher, wired to the modem controller as the app delegate wires it, on the test's clock.
+    var clock = Date(timeIntervalSince1970: 1_800_000_000)
+    lazy var watcher: SimSlotWatcher = SimSlotWatcher(
+        enabled: { true }, module: { "c0ffee01" },
+        switchSlot: { [unowned self] slot, expect, done in
+            self.modem.changeSimSlot(slot, automatic: true, expect: expect, completion: done)
+        }, now: { [unowned self] in self.clock })
+
+    /// Two background turns 25 s apart that read no SIM in slot 1: the watcher tries slot 2.
+    func emptySlotFor25s() {
+        let empty: Result<[String: PulseAnswer], ModemFailure> = .success(
+            ["AT+CPIN?": .refused("+CME ERROR: 10"), "AT+CFUN?": .lines(["+CFUN: 1"]),
+             "AT+QUIMSLOT?": .lines(["+QUIMSLOT: 1"])])
+        watcher.pulseAnswers(empty)
+        clock += 25
+        watcher.pulseAnswers(empty)
+    }
 
     /// applicationShouldTerminate: true is "terminate later".
     func quit() -> Bool { quitGate.ask() }
@@ -233,6 +277,8 @@ struct QuitGateTests {
         reviewCase()
         modemFailsFirst()
         bothSucceed()
+        quitWaitsForSwitchBack()
+        cancelledQuitFreesWatcher()
         print("quit gate: \(checks) checks passed")
     }
 
@@ -418,6 +464,61 @@ struct QuitGateTests {
               && app.messages.refreshEnabled, "modem first: the Messages controller works again", app.messages.result)
     }
 
+    // The SIM slot watcher's try and its switch back are one unit for the quit: asked while the try runs, the quit waits
+    // for the switch back too (the modem is never left on the empty slot it tried), and the app ends after both, with
+    // the watcher's line saying what came of them.
+    static func quitWaitsForSwitchBack() {
+        let app = App()
+        app.watcher.modemPresent(true)
+        app.emptySlotFor25s()
+        pump(until: { app.calls.log == ["setSimSlot 2"] && app.calls.blocked == 1 }, "switch back: the try runs")
+        check(app.quit() == true, "switch back: the quit waits for the try")
+        equal(app.modem.quitNotice.line, "RMNet quits when the SIM slot has been switched.", "switch back: the quit line")
+        app.modemFake.releaseSlot(.success(SimSlotChange(before: 1, after: 2, sim: .notInserted)))
+        pump(until: { app.calls.log == ["setSimSlot 2", "setSimSlot 1"] && app.calls.blocked == 1 },
+             "switch back: runs while the app quits")
+        settle()
+        check(app.replies.isEmpty, "switch back: the quit still waits", "\(app.replies)")
+        equal(app.modem.quitNotice.line, "RMNet quits when the SIM slot has been switched.", "switch back: the line stays")
+        app.modemFake.releaseSlot(.success(SimSlotChange(before: 2, after: 1, sim: .notInserted)))
+        pump(until: { !app.replies.isEmpty }, "switch back: the answer")
+        equal(app.replies, [true], "switch back: the app ends after both")
+        equal(app.watcher.line, "No SIM in either slot.", "switch back: the watcher heard of both")
+        check(!app.watcher.switchRunning && app.attention == 0, "switch back: nothing left running, no attention")
+        check(app.calls.mostAtOnce == 1, "switch back: one call at a time on the shared queue")
+    }
+
+    // A watcher's try that waits behind a read when the quit is asked is dropped, and the watcher hears it was
+    // cancelled; when the quit is then cancelled (the Messages send failed), the watcher is free and tries again after
+    // its patience, instead of waiting for a switch that will never run.
+    static func cancelledQuitFreesWatcher() {
+        let app = App()
+        app.startSend()
+        app.modem.setTabShown(.network)
+        holdTimer(app.modem)
+        check(app.modem.running == .reading, "cancelled: the modem's read waits behind the send")
+        app.watcher.modemPresent(true)
+        app.emptySlotFor25s()
+        check(app.watcher.switchRunning, "cancelled: the watcher's try waits behind the read")
+        check(app.quit() == true, "cancelled: the quit waits")
+        check(!app.watcher.switchRunning, "cancelled: the dropped try reported cancelled")
+        equal(app.modem.result, "", "cancelled: no result line for the dropped automatic switch")
+        app.smsFake.releaseSend(.failure(notKnown))
+        pump(until: { !app.replies.isEmpty }, "cancelled: the answer")
+        equal(app.replies, [false], "cancelled: the failed send cancels the quit")
+        pump(until: { app.calls.log == ["send", "networkInfo"] && app.calls.blocked == 1 }, "cancelled: the read runs")
+        app.modemFake.releaseInfo(.success(NetworkInfo(radio: .on, mode: "AUTO")))
+        pump(until: { app.modem.running == nil }, "cancelled: the read comes back")
+        app.modem.setTabShown(nil)
+        equal(app.watcher.pulseCommands(), SimSlotWatcher.commands, "cancelled: the watcher reads again")
+        app.clock += 15
+        app.emptySlotFor25s()
+        pump(until: { app.calls.log.last == "setSimSlot 2" && app.calls.blocked == 1 }, "cancelled: the try again")
+        app.modemFake.releaseSlot(.success(SimSlotChange(before: 1, after: 2, sim: .ready)))
+        pump(until: { !app.watcher.switchRunning }, "cancelled: the try finishes")
+        equal(app.watcher.line, "Switched to SIM 2: no SIM in slot 1.", "cancelled: its line")
+    }
+
     // Both calls succeed: the app ends once both have finished, not before.
     static func bothSucceed() {
         let app = App()
@@ -435,4 +536,8 @@ struct QuitGateTests {
         check(app.replies == [true] && app.attention == 0, "both succeed: true, once", "\(app.replies)")
         app.modem.setTabShown(nil)
     }
+}
+
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
 }

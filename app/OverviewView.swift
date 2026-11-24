@@ -2,8 +2,8 @@
 // bars and their word, the operator, the bands, and the addresses while connected); the live throughput (the
 // current rates over the last two minutes, and the data since the driver started); the signal (the RSRP over the
 // last ten minutes, shaded by quality); then three small cards: the SIM as the SIM & Data screen last read it,
-// the unread messages, and the driver, with a call to action when it needs one. With the driver not installed,
-// the whole Overview is an empty state whose action installs it.
+// the unread messages, and the driver, each with its button at the foot (a call to action when it needs one, else the
+// screen it summarises). With the driver not installed, the whole Overview is an empty state whose action installs it.
 //
 // What each card says comes from OverviewModel.swift (tested there); this file draws it. It reads nothing itself:
 // the shell's polls refresh the driver's status every 2 s and sample the throughput every second while it is shown
@@ -21,6 +21,7 @@ struct OverviewView: View {
     let modem: ModemController
     let messages: SmsController
     let throughput: ThroughputSampler
+    let simWatcher: SimSlotWatcher
     let navigate: (Screen) -> Void
     /// Install or Update was pressed here: the request's progress line stays shown (in the driver card or the empty
     /// state) after it finishes, until the Overview goes.
@@ -28,6 +29,7 @@ struct OverviewView: View {
 
     var body: some View {
         OverviewContent(driverStatus: driverStatus, modem: modem, messages: messages, throughput: throughput,
+                        simWatcher: simWatcher,
                         navigate: navigate, driverRequested: $driverRequested)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
@@ -49,6 +51,7 @@ private struct OverviewContent: View {
     let modem: ModemController
     let messages: SmsController
     let throughput: ThroughputSampler
+    let simWatcher: SimSlotWatcher
     let navigate: (Screen) -> Void
     @Binding var driverRequested: Bool
 
@@ -58,6 +61,7 @@ private struct OverviewContent: View {
         } else {
             ScrollView {
                 OverviewCards(driverStatus: driverStatus, modem: modem, messages: messages, throughput: throughput,
+                              simWatcher: simWatcher,
                               navigate: navigate, driverRequested: $driverRequested)
                     .padding(Spacing.xl)
                     .frame(maxWidth: 1100)
@@ -78,6 +82,7 @@ private struct OverviewCards: View {
     let modem: ModemController
     let messages: SmsController
     let throughput: ThroughputSampler
+    let simWatcher: SimSlotWatcher
     let navigate: (Screen) -> Void
     @Binding var driverRequested: Bool
     @State private var width: CGFloat = 0
@@ -90,7 +95,7 @@ private struct OverviewCards: View {
                                 driverRequested: $driverRequested)
         let driverFirst = !summary.lines.isEmpty
         VStack(alignment: .leading, spacing: Spacing.l) {
-            OverviewHero(driverStatus: driverStatus, modem: modem, wide: wide)
+            OverviewHero(driverStatus: driverStatus, modem: modem, wide: wide, navigate: navigate)
             if driverFirst {
                 driver
             }
@@ -100,13 +105,13 @@ private struct OverviewCards: View {
             }
             if wide && !driverFirst {
                 CardRow {
-                    SimCard(modem: modem, navigate: navigate)
+                    SimCard(modem: modem, simWatcher: simWatcher, navigate: navigate)
                     MessagesCard(messages: messages, navigate: navigate)
                     driver
                 }
             } else {
                 CardRow {
-                    SimCard(modem: modem, navigate: navigate)
+                    SimCard(modem: modem, simWatcher: simWatcher, navigate: navigate)
                     MessagesCard(messages: messages, navigate: navigate)
                 }
                 if !driverFirst {
@@ -137,13 +142,15 @@ private struct CardRow<Content: View>: View {
 /// The hero: the state in large type (Connected only while the driver's link is up); under it the technology badge,
 /// the bars with their word (signalCaption, as the menu bar panel says it: the radio off, searching or limited service
 /// when the modem says so), the operator and the bands as chips (primary first, then the aggregated carriers); the
-/// addresses while connected, beside them or below. An operator or bands not known are left out; an unknown signal
-/// (nothing read, or no RSRP) is outlined bars and "Signal not known", never "No signal". Washed with the state's
-/// colour.
+/// addresses while connected, beside them or below; and, while the modem is locked to a cell or a RAT's bands are
+/// locked (as the Network screen last read them), an orange badge that opens Network. An operator or bands not known
+/// are left out; an unknown signal (nothing read, or no RSRP) is outlined bars and "Signal not known", never "No
+/// signal". Washed with the state's colour.
 private struct OverviewHero: View {
     @ObservedObject var driverStatus: StatusController
     @ObservedObject var modem: ModemController
     var wide = true
+    let navigate: (Screen) -> Void
 
     var body: some View {
         let pill = connectionPill(driverStatus.connectionHeadline)
@@ -196,6 +203,20 @@ private struct OverviewHero: View {
                         signal
                         network
                     }
+                }
+                // A lock explains a connection that will not move to a better cell; as the Network screen last read
+                // it (the Overview reads neither the cell lock nor the bands), and a way there.
+                let locks = NetworkCards.lockParts(cellLock: modem.cellLock, bands: modem.bands)
+                if let lock = heroLockText(locks) {
+                    Button {
+                        navigate(.network)
+                    } label: {
+                        StateBadge(text: lock, symbol: "lock.fill", tint: .orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help(locks.joined(separator: "\n") + "\nAs the Network screen last read it. Open Network.")
+                    .accessibilityLabel(Text(verbatim: locks.joined(separator: "; ")))
+                    .accessibilityHint(Text("Opens Network"))
                 }
                 if let failure = modem.infoFailure {
                     Label {
@@ -380,7 +401,8 @@ private struct SignalCard: View {
                               label: "\(SignalMetric.rsrp.title(rat: history.rat)) over the last 10 minutes",
                               unit: SignalMetric.rsrp.unit, height: chartHeight)
                 } else {
-                    ChartPlaceholder(text: signalPlaceholder(modem.info, history), height: chartHeight)
+                    ChartPlaceholder(text: signalPlaceholder(modem.info, history, failure: modem.infoFailure),
+                                     height: chartHeight)
                 }
                 Spacer(minLength: 0)
                 Divider()
@@ -418,12 +440,16 @@ private struct ZoneKey: View {
 /// opens SIM & Data, where the unlock is); another state in its words; or not read yet.
 private struct SimCard: View {
     @ObservedObject var modem: ModemController
+    @ObservedObject var simWatcher: SimSlotWatcher
     let navigate: (Screen) -> Void
 
     var body: some View {
         let summary = simSummary(modem.sim)
+        // What the SIM slot watcher last did ("Switched to SIM 2: no SIM in slot 1.") comes before the read's time.
+        let slot = modem.sim?.activeSlot.map { "SIM \($0)" }
+        let asOf = modem.sim == nil ? nil : modem.settingsAt.map(sentenceAsOf)
         SmallCard(title: "SIM", symbol: "simcard", state: summary.state,
-                  note: modem.sim == nil ? nil : modem.settingsAt.map(sentenceAsOf)) {
+                  note: simWatcher.line ?? [slot, asOf].compactMap { $0 }.joined(separator: " · ").nilIfEmpty) {
             if let action = summary.action {
                 CardButton(title: action, prominent: summary.state.tone == .attention) { navigate(.simData) }
             }
@@ -440,7 +466,7 @@ private struct MessagesCard: View {
         let state = messagesState(listed: messages.listed, unread: messages.unread.count,
                                   messageCount: messages.messages.count)
         SmallCard(title: "Messages", symbol: "message", state: state, note: messages.listedAt.map(sentenceAsOf)) {
-            CardButton(title: "Open", prominent: false) { navigate(.messages) }
+            CardButton(title: "Open Messages", prominent: false) { navigate(.messages) }
         }
     }
 }
@@ -645,4 +671,8 @@ private struct NotInstalledState: View {
         driverRequested = true
         driverStatus.install()
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

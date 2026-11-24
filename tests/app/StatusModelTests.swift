@@ -467,6 +467,18 @@ struct StatusModelTests {
               "statusJSON unknown: no button may act", "\(unknown)")
         check((unknown["properties"] as? [String: String])?["RMNetState"] == "up", "statusJSON unknown: registry still read")
 
+        // --- the Driver screen's line beside its buttons ----------------------------------------
+        let one = status([ExtensionEntry(version: "318.19.40", enabled: true, awaitingApproval: false, uninstalling: false)])
+        check(driverActionNote(status([]), bundledVersion: "318.20.1") == "This app carries version 318.20.1.",
+              "action note: install")
+        check(driverActionNote(one, bundledVersion: "318.20.1")
+                == "This app carries version 318.20.1, newer than 318.19.40.", "action note: update")
+        check(driverActionNote(one, bundledVersion: "318.19.40") == "This app carries the version installed, 318.19.40.",
+              "action note: reinstall")
+        check(driverActionNote(one, bundledVersion: "318.18.1")
+                == "This app carries version 318.18.1, older than 318.19.40.", "action note: replace")
+        check(driverActionNote(one, bundledVersion: "") == "This app carries no driver.", "action note: no driver bundled")
+
         print("app-test: \(checks) checks passed")
     }
 }

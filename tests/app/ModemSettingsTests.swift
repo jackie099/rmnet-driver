@@ -86,6 +86,7 @@ func expectNoSecret(_ text: String, _ name: String) {
 struct NoModem: ModemServing {
     let failure = ModemFailure(message: "The modem is not attached.")
     func networkInfo() -> Result<NetworkInfo, ModemFailure> { .failure(failure) }
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> { .failure(failure) }
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> { .failure(failure) }
     func setMode(_ mode: String) -> Result<ModeChange, ModemFailure> { .failure(failure) }
     func profiles() -> Result<[DataProfile], ModemFailure> { .failure(failure) }
@@ -99,6 +100,17 @@ struct NoModem: ModemServing {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> { .failure(failure) }
     func bands() -> Result<[BandSet], ModemFailure> { .failure(failure) }
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> { .failure(failure) }
+    func cellLock() -> Result<CellLockState, ModemFailure> { .failure(failure) }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func imei() -> Result<String, ModemFailure> { .failure(failure) }
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite { ImeiWrite(outcome: .failure(failure)) }
+    func simSlot() -> Result<Int, ModemFailure> { .failure(failure) }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
+        .failure(failure)
+    }
 }
 
 @main
@@ -498,9 +510,33 @@ struct ModemSettingsTests {
                    [("SIM", "blocked: needs its PUK from the carrier"), ("PIN lock", "on"), ("Attempts left", "PIN 0, PUK 10")],
                    "blocked")
         expectEqual(jsonText(simJSON(readySim), "simJSON"),
-                    "{\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}", "simJSON: ready")
+                    "{\"activeSlot\":null,\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}",
+                    "simJSON: ready (activeSlot added, null when not read)")
+        var slotted = readySim
+        slotted.activeSlot = 2
+        expectEqual(jsonText(simJSON(slotted), "simJSON slot"),
+                    "{\"activeSlot\":2,\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}",
+                    "simJSON: with the slot")
+        expectRows(simRows(slotted), [("SIM", "ready"), ("PIN lock", "off"), ("Attempts left", "PIN 3, PUK 10"), ("Slot", "2")],
+                   "the slot as the last row")
+        // AT+QUIMSLOT? and the SIM states.
+        check(parseSimSlot(["+QUIMSLOT: 1"]) == 1 && parseSimSlot(["+QUIMSLOT: 2"]) == 2, "parseSimSlot: 1 and 2")
+        check(parseSimSlot(["+QUIMSLOT: 3"]) == nil && parseSimSlot(["+QUIMSLOT: x"]) == nil && parseSimSlot([]) == nil
+                && parseSimSlot(["+QUIMSLOT:"]) == nil, "parseSimSlot: another value, none")
+        expectEqual(simSlotCommand(2), "AT+QUIMSLOT=2", "simSlotCommand")
+        check(otherSimSlot(1) == 2 && otherSimSlot(2) == 1, "otherSimSlot")
+        check(simUnusable(simState(fromError: "+CME ERROR: 10")) && simUnusable(simState(fromError: "+CME ERROR: 13")),
+              "simUnusable: CME 10 (not inserted) and 13 (SIM failure)")
+        check(!simUnusable(simState(fromError: "+CME ERROR: 14")) && !simUnusable(.ready) && !simUnusable(.pin)
+                && !simUnusable(.other("+CME ERROR: 15")), "simUnusable: not busy, ready, a PIN or another answer")
+        check(simState(PulseAnswer.refused("+CME ERROR: 10")) == .notInserted
+                && simState(PulseAnswer.lines(["+CPIN: READY"])) == .ready && simState(PulseAnswer.lines([])) == nil,
+              "simState of a short read")
+        let q = simSlotQuestion(from: 1, to: 2)
+        check(q.title == "Switch to SIM 2?" && q.message.hasPrefix("The modem uses SIM 1 now. The connection drops"),
+              "simSlotQuestion", q.message)
         expectEqual(jsonText(simJSON(SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil)), "simJSON"),
-                    "{\"pinAttempts\":null,\"pinLock\":null,\"pukAttempts\":null,\"state\":\"not inserted\"}",
+                    "{\"activeSlot\":null,\"pinAttempts\":null,\"pinLock\":null,\"pukAttempts\":null,\"state\":\"not inserted\"}",
                     "simJSON: nulls where unknown")
         for (state, word) in [
             (SimState.ready, "ready"), (.pin, "pin"), (.puk, "puk"), (.pin2, "pin2"), (.puk2, "puk2"),
@@ -746,6 +782,113 @@ struct ModemSettingsTests {
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: nil)), "The SIM accepted the PIN.", "pinSentence: accepted, unread")
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: SimInfo(state: .pin2, pinLock: true, pinAttempts: 3, pukAttempts: 10))),
                     "The SIM accepted the PIN (SIM: asks for PIN2).", "pinSentence: accepted, another state")
+
+        // --- cell lock (AT+QNWLOCK) ------------------------------------------------------------
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",0"]) == [], "parseLteCellLock: unlocked")
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",2,1300,128,100,45"]) == [
+            LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45),
+        ], "parseLteCellLock: 2 cells")
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",2,1300,128"]) == nil, "parseLteCellLock: count mismatch")
+        check(parseLteCellLock([]) == nil, "parseLteCellLock: empty")
+
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",0"]) == .unlocked, "parseNrCellLock: unlocked")
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",147,520110,30,41"]) == .locked(
+            NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)), "parseNrCellLock: locked")
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",147,520110,30"]) == nil, "parseNrCellLock: missing band")
+
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",0,0"])! == (lte: false, nr: false), "parseCellLockPersist: 0,0")
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",1,1"])! == (lte: true, nr: true), "parseCellLockPersist: 1,1")
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",2,0"]) == nil, "parseCellLockPersist: invalid 2")
+
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41), supportedSaBands: [25, 41, 71]) == nil,
+              "nrCellLockProblem: valid")
+        check(nrCellLockProblem(NrCellLock(pci: 1008, arfcn: 520110, scsKHz: 30, band: 41)) != nil, "nrCellLockProblem: pci > 1007")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 0, scsKHz: 30, band: 41)) != nil, "nrCellLockProblem: arfcn 0")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 25, band: 41)) != nil, "nrCellLockProblem: bad scs")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 78), supportedSaBands: [25, 41]) != nil,
+              "nrCellLockProblem: unsupported band")
+
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 128)]) == nil, "lteCellLockProblem: valid")
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 504)]) != nil, "lteCellLockProblem: pci > 503")
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 1), LteLockedCell(earfcn: 1300, pci: 1)]) != nil,
+              "lteCellLockProblem: duplicate")
+        check(lteCellLockProblem((0...10).map { LteLockedCell(earfcn: 100, pci: $0) }) != nil,
+              "lteCellLockProblem: > 10 cells")
+
+        expectEqual(nrCellLockCommand(nil), "AT+QNWLOCK=\"common/5g\",0", "nrCellLockCommand: unlock")
+        expectEqual(nrCellLockCommand(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)),
+                    "AT+QNWLOCK=\"common/5g\",147,520110,30,41", "nrCellLockCommand: lock")
+        expectEqual(lteCellLockCommand([]), "AT+QNWLOCK=\"common/4g\",0", "lteCellLockCommand: unlock")
+        expectEqual(lteCellLockCommand([LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45)]),
+                    "AT+QNWLOCK=\"common/4g\",2,1300,128,100,45", "lteCellLockCommand: lock")
+        expectEqual(cellLockPersistCommand(lte: true, nr: false), "AT+QNWLOCK=\"save_ctrl\",1,0", "cellLockPersistCommand")
+
+        // A cell in use, against the serving cell and the carriers read with the lock.
+        let saLeg = parseServingCell(
+            ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"FDD\",310,260,00A1B2C3D,683,001A2B,396250,25,3,-92,-11,20,0,-"])
+        let scc = parseCarrierComponents(["+QCAINFO: \"PCC\",396250,3,\"NR5G BAND 25\",683",
+                                          "+QCAINFO: \"SCC\",520110,12,\"NR5G BAND 41\",2,147,0,-,-"])
+        let n41 = NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)
+        check(cellInUseLock(.nr(n41), serving: saLeg, carriers: scc) == .nr(n41),
+              "cellInUseLock: a secondary carrier is in use (its SCS the owner's: the modem gives none for it)")
+        check(cellInUseLock(.nr(NrCellLock(pci: 683, arfcn: 396250, scsKHz: 30, band: 25)), serving: saLeg, carriers: scc)
+                == .refused("The modem reports a subcarrier spacing of 15 kHz for that cell, not 30 kHz."),
+              "cellInUseLock: the serving leg's SCS must be the lock's")
+        check(cellInUseLock(.nr(n41), serving: saLeg, carriers: []) == .refused(
+                "The modem no longer uses that 5G SA cell (n41, PCI 147, ARFCN 520110)."),
+              "cellInUseLock: a carrier gone since")
+        let endc = parseServingCell(["+QENG: \"servingcell\",\"NOCONN\"",
+                                     "+QENG: \"LTE\",\"FDD\",310,260,0ABC123,101,1300,3,5,5,5A0B,-95,-11,-65,15,9,-,-",
+                                     "+QENG: \"NR5G-NSA\",310,260,147,-90,20,-11,520110,41,12,1"])
+        check(cellInUseLock(.nr(n41), serving: endc, carriers: scc) == .refused(
+                "The modem no longer uses that 5G SA cell (n41, PCI 147, ARFCN 520110)."),
+              "cellInUseLock: an NSA leg is not a 5G SA cell in use")
+        check(cellInUseLock(.serving(scsKHz: nil), serving: endc, carriers: []) == .lte(LteLockedCell(earfcn: 1300, pci: 101)),
+              "cellInUseLock: on EN-DC the serving cell is the LTE leg")
+        let lteScc = parseCarrierComponents(["+QCAINFO: \"SCC\",66786,100,\"LTE BAND 66\",1,128,-95,-11,-65,15"])
+        check(cellInUseLock(.lte(LteLockedCell(earfcn: 66786, pci: 128)), serving: endc, carriers: lteScc)
+                == .lte(LteLockedCell(earfcn: 66786, pci: 128)), "cellInUseLock: an LTE carrier is in use")
+        check(cellInUseLock(.serving(scsKHz: nil), serving: nil, carriers: [])
+                == .refused("No lockable 5G SA or LTE serving cell is currently active."), "cellInUseLock: nothing serves")
+        check(cellInUseProblem(.serving(scsKHz: 45)) != nil && cellInUseProblem(.serving(scsKHz: 60)) == nil
+                && cellInUseProblem(.serving(scsKHz: nil)) == nil, "cellInUseProblem: an SCS given must be a spacing")
+
+        let lockState = CellLockState(lte: [], nr: NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41),
+                                      persistLte: false, persistNr: false)
+        check(JSONSerialization.isValidJSONObject(cellLockJSON(lockState)), "cellLockJSON: valid")
+        expectEqual(cellLockSentence(.changed(before: CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false),
+                                              after: lockState)),
+                    "Locked 5G SA cell to band n41, PCI 147, ARFCN 520110, SCS 30 kHz.", "cellLockSentence: locked NR")
+
+        // --- IMEI (AT+EGMR) --------------------------------------------------------------------
+        check(parseImei(["+EGMR: \"000000000000141\""]) == "000000000000141", "parseImei: fixture")
+        check(parseImei(["+EGMR: \"123\""]) == nil, "parseImei: short gives nil")
+        check(parseImei([]) == nil, "parseImei: empty gives nil")
+        check(imeiCheckDigit(forFirst14: "00000000000014") == 1, "imeiCheckDigit: a made-up IMEI")
+        check(imeiCheckDigit(forFirst14: "00000000000009") == 1, "imeiCheckDigit: another made-up IMEI")
+        check(imeiProblem("000000000000141") == nil, "imeiProblem: valid (made up)")
+        check(imeiProblem("000000000000091") == nil, "imeiProblem: valid (another made up)")
+        expectEqual(imeiProblem("000000000000142") ?? "",
+                    "The IMEI check digit is not valid (expected 1 as the 15th digit).", "imeiProblem: bad check digit")
+        expectEqual(imeiProblem("12345") ?? "", "An IMEI is 15 ASCII digits (0 to 9).", "imeiProblem: too short")
+        expectEqual(imeiCommand("000000000000141"), "AT+EGMR=1,7,\"000000000000141\"", "imeiCommand")
+        check(JSONSerialization.isValidJSONObject(imeiJSON("000000000000141")), "imeiJSON: valid")
+
+        // --- IMEI words and SIM states told apart ------------------------------------------------
+        let restartSentence = "The IMEI is now 123456789012347, but the modem was not restarted. Made-up reason."
+        expectEqual(imeiSentence(.restartFailed(before: "000000000000091", after: "123456789012347",
+                                                sentence: restartSentence)), restartSentence,
+                    "imeiSentence: a restart that failed says so")
+        expectEqual(imeiQuestion(before: "000000000000091", after: "123456789012347", reboot: false,
+                                 module: "TESTMODULE1").message,
+                    "Module: TESTMODULE1.\nCurrent IMEI: 000000000000091.\nNew IMEI: 123456789012347.\n"
+                    + "The new IMEI is stored and takes effect after the next modem restart.",
+                    "imeiQuestion: names the module it is confirmed for")
+        check(service.imeiReading() == .failure(ModemFailure(message: "The modem is not attached.")),
+              "imeiReading: a service without its own reads the IMEI, on a module not known")
+        check(simConclusive(.ready) == true && simConclusive(.pin) == true && simConclusive(.notInserted) == false
+                && simConclusive(.failure) == false && simConclusive(.busy) == nil && simConclusive(.other("x")) == nil,
+              "simConclusive: usable, none usable, or not told yet")
 
         print("modem settings: \(checks) checks passed")
     }

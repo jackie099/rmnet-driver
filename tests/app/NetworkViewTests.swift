@@ -297,5 +297,132 @@ struct NetworkViewTests {
         // Duplicates count once.
         equal(NetworkCards.bandsCount(set(.lte, allowed: [3, 3], supported: [3, 7, 7])), "1 of 2 allowed",
               "bands: count as sets")
+
+        // --- SCS row, carrierComponents chips, antenna tiles & quick lock targets --------------
+        let scsLeg = CellLeg(rat: "NR5G-SA", duplex: "TDD", mcc: "310", mnc: "260", cellID: "123", pci: 683, tac: "1F",
+                             channel: 396250, band: "n25", bandwidthMHz: 20, rsrp: -92, rsrq: -11, sinr: 20, scsKHz: 15)
+        check(NetworkCards.cellRows([scsLeg]).contains(NetworkCards.CellRow(label: "SCS", values: ["15 kHz"])),
+              "cellRows: includes SCS when reported")
+
+        var richInfo = info([scsLeg], carriers: ["n25", "n41"])
+        richInfo.carrierComponents = [
+            CarrierComponent(role: "PCC", rat: "NR5G", band: "n25", channel: 396250, bandwidthMHz: 20, pci: 683),
+            CarrierComponent(role: "SCC", rat: "NR5G", band: "n41", channel: 520110, bandwidthMHz: 100, pci: 147),
+        ]
+        equal(NetworkCards.carrierChips(richInfo), [
+            NetworkCards.CarrierChip(band: "n25", bandwidthMHz: 20, primary: true, channel: 396250, pci: 683),
+            NetworkCards.CarrierChip(band: "n41", bandwidthMHz: 100, primary: false, channel: 520110, pci: 147),
+        ], "carrierChips: carries SCC bandwidth, channel and PCI from carrierComponents")
+
+        let tiles = NetworkCards.antennaTiles([
+            AntennaSignalSet(rat: "NR5G", ports: [
+                AntennaPort(index: 0, name: "PRX", rsrp: -93, rsrq: -11, sinr: 20),
+                AntennaPort(index: 1, name: "DRX", rsrp: -110, rsrq: -16, sinr: 10),
+                AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+                AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+            ])
+        ])
+        check(tiles.count == 4 && tiles[0].active && tiles[0].rsrpText == "-93" && tiles[0].title == "PRX"
+                && tiles[0].detailText == "RSRQ -11 dB · SINR 20 dB" && tiles[0].help == "Receive path 1, primary (PRX)"
+                && !tiles[2].active && tiles[2].detailText == "Not in use" && tiles[2].rsrpText == "—"
+                && tiles[2].quality == nil,
+              "antennaTiles: formats active and inactive paths", "\(tiles)")
+        equal(tiles.map { $0.quality }, [2, 1, nil, nil], "antennaTiles: the RSRP's quality zone")
+        equal(NetworkCards.antennaTiles([AntennaSignalSet(rat: "LTE", ports: [
+            AntennaPort(index: 0, name: "PRX", rsrp: -90, rsrq: nil, sinr: nil)])])[0].detailText, "In use",
+              "antennaTiles: an RSRP alone")
+        equal(NetworkCards.ratName("NR5G"), "5G", "ratName: NR5G")
+        equal(NetworkCards.ratName("LTE"), "LTE", "ratName: LTE")
+
+        let targets = NetworkCards.lockTargets(richInfo)
+        equal(targets, [
+            NetworkCards.LockTarget(band: "n25", role: "Primary", detail: "20 MHz · PCI 683 · ARFCN 396250",
+                                    kind: .nr(NetworkCards.NrCellTarget(pci: 683, arfcn: 396250, band: 25, scsKHz: 15))),
+            NetworkCards.LockTarget(band: "n41", role: "Secondary", detail: "100 MHz · PCI 147 · ARFCN 520110",
+                                    kind: .nr(NetworkCards.NrCellTarget(pci: 147, arfcn: 520110, band: 41, scsKHz: nil))),
+        ], "lockTargets: builds quick-lock entries for PCC and SCC; the SCC's spacing not reported, not guessed")
+        equal(targets[0].label, "n25 · 20 MHz · PCI 683 · ARFCN 396250", "lockTargets: label")
+        // EN-DC: no 5G SA target (an NSA leg cannot be locked with common/5g); the LTE leg is one.
+        let endcTargets = NetworkCards.lockTargets(info([lte, nsaNr]))
+        equal(endcTargets.map { $0.band + " " + $0.role }, ["B3 Serving"], "lockTargets: EN-DC gives the LTE leg only")
+        equal(endcTargets.first?.detail, "20 MHz · PCI 101 · EARFCN 1300", "lockTargets: LTE detail")
+        equal(NetworkCards.lockTargets(nil), [], "lockTargets: nothing read")
+
+        cellLock()
+        neighbours()
+    }
+
+    static func cellLock() {
+        let nr = NrCellLock(pci: 186, arfcn: 520110, scsKHz: 30, band: 41)
+        let lockedNr = CellLockState(lte: [], nr: nr, persistLte: true, persistNr: true)
+        let lteOne = CellLockState(lte: [LteLockedCell(earfcn: 66786, pci: 128)], nr: nil, persistLte: false, persistNr: false)
+        let lteThree = CellLockState(lte: [LteLockedCell(earfcn: 66786, pci: 128), LteLockedCell(earfcn: 5110, pci: 301),
+                                           LteLockedCell(earfcn: 1300, pci: 7)], nr: nil, persistLte: false, persistNr: false)
+        let open = CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+
+        equal(NetworkCards.nrLockText(nr), "n41 · PCI 186 · ARFCN 520110 · SCS 30 kHz", "nrLockText")
+        equal(NetworkCards.lteLockText(lteOne.lte), "PCI 128 · EARFCN 66786", "lteLockText: one")
+        equal(NetworkCards.lteLockText(lteThree.lte), "3 cells (PCI 128, 301, 7)", "lteLockText: three")
+
+        let nrTarget = NetworkCards.LockTarget(band: "n41", role: "Primary", detail: "",
+                                               kind: .nr(NetworkCards.NrCellTarget(pci: 186, arfcn: 520110, band: 41, scsKHz: 30)))
+        let noScs = NetworkCards.LockTarget(band: "n41", role: "Secondary", detail: "",
+                                            kind: .nr(NetworkCards.NrCellTarget(pci: 186, arfcn: 520110, band: 41, scsKHz: nil)))
+        let lteTarget = NetworkCards.LockTarget(band: "B66", role: "Serving", detail: "",
+                                                kind: .lte(LteLockedCell(earfcn: 66786, pci: 128)))
+        check(NetworkCards.targetIsLocked(nrTarget, lockedNr), "targetIsLocked: the 5G SA lock")
+        check(!NetworkCards.targetIsLocked(nrTarget, open) && !NetworkCards.targetIsLocked(nrTarget, nil),
+              "targetIsLocked: not locked, or not read")
+        check(NetworkCards.targetIsLocked(lteTarget, lteOne), "targetIsLocked: the one LTE cell")
+        check(!NetworkCards.targetIsLocked(lteTarget, lteThree), "targetIsLocked: one of several is not the lock")
+        check(NetworkCards.targetIsLocked(noScs, lockedNr), "targetIsLocked: a cell whose spacing is not reported, by its numbers")
+        let other15 = CellLockState(lte: [], nr: NrCellLock(pci: 186, arfcn: 520110, scsKHz: 15, band: 41),
+                                    persistLte: false, persistNr: false)
+        check(!NetworkCards.targetIsLocked(nrTarget, other15), "targetIsLocked: a spacing reported must be the lock's")
+        // The sheet's Lock: a cell in use is locked only while it still is (lockCellInUse); another as typed.
+        check(NetworkCards.inUse(nr, among: [nrTarget, lteTarget]) && NetworkCards.inUse(nr, among: [noScs]),
+              "inUse: a 5G SA cell in use")
+        check(!NetworkCards.inUse(NrCellLock(pci: 187, arfcn: 520110, scsKHz: 30, band: 41), among: [nrTarget, noScs]),
+              "inUse: another PCI is typed, not in use")
+        check(!NetworkCards.inUse(NrCellLock(pci: 186, arfcn: 520110, scsKHz: 15, band: 41), among: [nrTarget]),
+              "inUse: a spacing other than the one reported is not that cell")
+        check(NetworkCards.inUse(LteLockedCell(earfcn: 66786, pci: 128), among: [lteTarget])
+                && !NetworkCards.inUse(LteLockedCell(earfcn: 66786, pci: 129), among: [lteTarget]), "inUse: an LTE cell")
+
+        let allNr = [25, 41, 71, 77, 78]
+        let openBands = [set(.lte, allowed: [3, 66], supported: [3, 66]), set(.nsa, allowed: allNr, supported: allNr),
+                         set(.sa, allowed: allNr, supported: allNr)]
+        check(NetworkCards.lockSummary(cellLock: open, bands: openBands) == nil, "lockSummary: nothing locked")
+        check(NetworkCards.lockSummary(cellLock: nil, bands: nil) == nil, "lockSummary: nothing read")
+        equal(NetworkCards.lockSummary(cellLock: lockedNr, bands: nil), "5G SA cell n41 · PCI 186", "lockSummary: 5G SA cell")
+        equal(NetworkCards.lockSummary(cellLock: lteOne, bands: nil), "LTE cell PCI 128", "lockSummary: LTE cell")
+        equal(NetworkCards.lockSummary(cellLock: lteThree, bands: nil), "3 LTE cells", "lockSummary: LTE cells")
+        let saLocked = [set(.lte, allowed: [3, 66], supported: [3, 66]), set(.nsa, allowed: [78], supported: allNr),
+                        set(.sa, allowed: [71, 41, 25], supported: allNr)]
+        equal(NetworkCards.lockSummary(cellLock: lockedNr, bands: saLocked),
+              "5G SA cell n41 · PCI 186; 5G NSA band n78; 5G SA bands n25, n41, n71", "lockSummary: cell and bands")
+        let many = Array(1...30)
+        equal(NetworkCards.lockSummary(cellLock: nil, bands: [set(.lte, allowed: Array(1...12), supported: many)]),
+              "LTE: 12 of 30 bands", "lockSummary: many bands counted")
+    }
+
+    static func neighbours() {
+        let cells = [
+            NeighbourCell(rat: "NR5G", kind: "inter", channel: 396250, pci: 412, rsrp: -101, rsrq: -14, sinr: 1),
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10700, pci: 77, rsrp: nil, rsrq: nil, sinr: nil),
+            NeighbourCell(rat: "NR5G", kind: "intra", channel: 520110, pci: 147, rsrp: -97, rsrq: -13, sinr: 4),
+            NeighbourCell(rat: "LTE", kind: "inter", channel: 5110, pci: 301, rsrp: -118, rsrq: -16, sinr: nil),
+        ]
+        let rows = NetworkCards.neighbourRows(cells)
+        equal(rows.map { $0.pci }, ["147", "412", "301", "77"], "neighbours: strongest first, no RSRP last")
+        equal(rows[0], NetworkCards.NeighbourRow(rat: "5G", frequency: "Same", pci: "147", channel: "520110",
+                                                 rsrp: "-97 dBm", rsrq: "-13 dB", sinr: "4 dB", quality: 2),
+              "neighbours: a 5G cell on the serving channel")
+        equal(rows[1].frequency, "Other", "neighbours: another channel")
+        equal(rows[2].quality, 1, "neighbours: a poor LTE RSRP")
+        equal(rows[3], NetworkCards.NeighbourRow(rat: "WCDMA", frequency: "—", pci: "77", channel: "10700",
+                                                 rsrp: "—", rsrq: "—", sinr: "—", quality: nil),
+              "neighbours: nothing known but its numbers")
+        equal(NetworkCards.neighbourRows([]), [], "neighbours: none")
     }
 }

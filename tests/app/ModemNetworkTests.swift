@@ -36,11 +36,12 @@ let endc = ["+QENG: \"servingcell\",\"CONNECT\"",
             "+QENG: \"NR5G-NSA\",460,00,513,-90,15,-11,627264,78,12,1"]
 
 let saLeg = CellLeg(rat: "NR5G-SA", duplex: "TDD", mcc: "460", mnc: "00", cellID: "123456789", pci: 32,
-                    tac: "1A2B3C", channel: 504990, band: "n41", bandwidthMHz: 100, rsrp: -95, rsrq: -10, sinr: 8)
+                    tac: "1A2B3C", channel: 504990, band: "n41", bandwidthMHz: 100, rsrp: -95, rsrq: -10, sinr: 8,
+                    scsKHz: 30)
 let lteLeg = CellLeg(rat: "LTE", duplex: "FDD", mcc: "460", mnc: "00", cellID: "1C2D3E4", pci: 128, tac: "2B3C",
                      channel: 1300, band: "B3", bandwidthMHz: 10, rsrp: -98, rsrq: -11, sinr: 8)
 let nsaLeg = CellLeg(rat: "NR5G-NSA", duplex: nil, mcc: "460", mnc: "00", cellID: nil, pci: 513, tac: nil,
-                     channel: 627264, band: "n78", bandwidthMHz: 100, rsrp: -90, rsrq: -11, sinr: 15)
+                     channel: 627264, band: "n78", bandwidthMHz: 100, rsrp: -90, rsrq: -11, sinr: 15, scsKHz: 30)
 
 // Every read above combined, as the service puts them together (R1: plmn only from AT+QSPN).
 func combined(radio: [String] = cfun, fiveG: [String] = c5greg, eps: [String] = cereg, ps: [String] = cgreg,
@@ -60,6 +61,7 @@ func combined(radio: [String] = cfun, fiveG: [String] = c5greg, eps: [String] = 
     info.plmn = sp.plmn
     info.serving = parseServingCell(qeng)
     info.carriers = parseCarriers(qcainfo)
+    info.carrierComponents = parseCarrierComponents(qcainfo)
     info.mode = parseModePreference(mode)
     info.nr5gDisable = parseNr5gDisable(nr5g)
     return info
@@ -91,9 +93,9 @@ func roundTrip(_ object: [String: Any], _ name: String) -> [String: Any] {
 }
 
 let jsonKeys: Set<String> = ["radio", "registration", "roaming", "operator", "networkName", "plmn", "technology",
-                             "state", "cells", "carriers", "mode", "nr5gDisableMode"]
+                             "state", "cells", "carriers", "carrierComponents", "mode", "nr5gDisableMode"]
 let cellKeys: Set<String> = ["rat", "duplex", "mcc", "mnc", "cellId", "pci", "tac", "channel", "band",
-                             "bandwidthMHz", "rsrp", "rsrq", "sinr"]
+                             "bandwidthMHz", "scsKHz", "rsrp", "rsrq", "sinr"]
 
 @main
 struct ModemNetworkTests {
@@ -236,7 +238,8 @@ struct ModemNetworkTests {
 
         let dashes = parseServingCell(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",460,00,123456789,-,-,,x,99,-,,abc,1,-"])
         check(dashes?.cells == [CellLeg(rat: "NR5G-SA", duplex: "TDD", mcc: "460", mnc: "00", cellID: "123456789", pci: nil,
-                                        tac: nil, channel: nil, band: nil, bandwidthMHz: nil, rsrp: nil, rsrq: nil, sinr: nil)],
+                                        tac: nil, channel: nil, band: nil, bandwidthMHz: nil, rsrp: nil, rsrq: nil, sinr: nil,
+                                        scsKHz: 30)],
               "parseServingCell: -, empty, not a number and an unknown bandwidth code give nil", "\(String(describing: dashes))")
 
         let extra = parseServingCell([sa[0] + ",7,8,\"x\",9"])
@@ -372,7 +375,7 @@ struct ModemNetworkTests {
             ("Band", "n41 + n28 (carrier aggregation)"),
             ("Signal", "RSRP -95 dBm, RSRQ -10 dB, SINR 8 dB"),
             ("Cell", "PCI 32, cell ID 123456789, TAC 1A2B3C"),
-            ("Channel", "ARFCN 504990, 100 MHz"),
+            ("Channel", "ARFCN 504990, 100 MHz, SCS 30 kHz"),
             ("Connection", "idle"),
             ("Radio", "on"),
             ("Network mode", "automatic (5G, LTE and WCDMA)"),
@@ -388,7 +391,7 @@ struct ModemNetworkTests {
             ("Cell (LTE)", "PCI 128, cell ID 1C2D3E4, TAC 2B3C"),
             ("Cell (5G)", "PCI 513"),
             ("Channel (LTE)", "EARFCN 1300, 10 MHz"),
-            ("Channel (5G)", "ARFCN 627264, 100 MHz"),
+            ("Channel (5G)", "ARFCN 627264, 100 MHz, SCS 30 kHz"),
             ("Connection", "connected"),
             ("Radio", "on"),
             ("Network mode", "automatic (5G, LTE and WCDMA)"),
@@ -520,7 +523,7 @@ struct ModemNetworkTests {
         let cutJSON = roundTrip(networkJSON(cut), "a cut-off line")
         let cutCell = (cutJSON["cells"] as? [[String: Any]])?.first ?? [:]
         check(Set(cutCell.keys) == cellKeys, "networkJSON: a cut-off leg keeps every key", "\(cutCell.keys.sorted())")
-        for key in ["tac", "channel", "band", "bandwidthMHz", "rsrp", "rsrq", "sinr"] {
+        for key in ["tac", "channel", "band", "bandwidthMHz", "scsKHz", "rsrp", "rsrq", "sinr"] {
             check(cutCell[key] is NSNull, "networkJSON: a cut-off leg gives null for \(key)", "\(String(describing: cutCell[key]))")
         }
         let searching = roundTrip(networkJSON(combined(qeng: ["+QENG: \"servingcell\",\"SEARCH\""])), "searching")
@@ -554,6 +557,112 @@ struct ModemNetworkTests {
             check((got["registration"] as? [String: Any])?["status"] as? String == word && got["roaming"] as? Bool == roaming,
                   "networkJSON: registration status \(word)", "\(got)")
         }
+
+        // --- SCS codes & parseCarrierComponents -------------------------------------------------
+        for (code, khz) in [(0, 15), (1, 30), (2, 60), (3, 120), (4, 240)] {
+            let line = "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",310,260,00A1B2C3D,683,001A2B,396250,25,3,-92,-11,20,\(code),-"
+            check(parseServingCell([line])?.cells.first?.scsKHz == khz, "parseServingCell: scs code \(code) is \(khz) kHz")
+        }
+
+        let liveQca = [
+            "+QCAINFO: \"PCC\",396250,3,\"NR5G BAND 25\",683",
+            "+QCAINFO: \"SCC\",520110,12,\"NR5G BAND 41\",2,147,0,-,-",
+        ]
+        check(parseCarrierComponents(liveQca) == [
+            CarrierComponent(role: "PCC", rat: "NR5G", band: "n25", channel: 396250, bandwidthMHz: 20, pci: 683),
+            CarrierComponent(role: "SCC", rat: "NR5G", band: "n41", channel: 520110, bandwidthMHz: 100, pci: 147),
+        ], "parseCarrierComponents: 5G SA PCC + 9-field SCC with PCI and bandwidth", "\(parseCarrierComponents(liveQca))")
+
+        let lteQca = [
+            "+QCAINFO: \"SCC\",100,50,\"LTE BAND 1\",1,12,0,-,-",
+            "+QCAINFO: \"PCC\",1300,75,\"LTE BAND 3\",1,128,-98,-11,-68,14",
+        ]
+        check(parseCarrierComponents(lteQca) == [
+            CarrierComponent(role: "PCC", rat: "LTE", band: "B3", channel: 1300, bandwidthMHz: 15, pci: 128),
+            CarrierComponent(role: "SCC", rat: "LTE", band: "B1", channel: 100, bandwidthMHz: 10, pci: 12),
+        ], "parseCarrierComponents: LTE PCC before SCC, RB bandwidths and PCIs")
+
+        // --- per-antenna signals (AT+QRSRP / AT+QRSRQ / AT+QSINR) ------------------------------
+        let antSets = parseAntennaSignals(
+            rsrp: ["+QRSRP: -93,-110,-32768,-140,NR5G"],
+            rsrq: ["+QRSRQ: -11,-16,-32768,-32768,NR5G"],
+            sinr: ["+QSINR: 20,10,-32768,-20,NR5G"]
+        )
+        check(antSets == [
+            AntennaSignalSet(rat: "NR5G", ports: [
+                AntennaPort(index: 0, name: "PRX", rsrp: -93, rsrq: -11, sinr: 20),
+                AntennaPort(index: 1, name: "DRX", rsrp: -110, rsrq: -16, sinr: 10),
+                AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+                AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+            ])
+        ], "parseAntennaSignals: -32768 and correlated -140/-20 floor sentinels become inactive", "\(antSets)")
+        let antEndc = parseAntennaSignals(
+            rsrp: ["+QRSRP: -93,-110,-110,-103,NR5G", "+QRSRP: -98,-99,-32768,-32768,LTE"],
+            rsrq: ["+QRSRQ: -11,-16,-11,-11,NR5G", "+QRSRQ: -12,-13,-32768,-32768,LTE"],
+            sinr: ["+QSINR: 20,10,11,11,NR5G", "+QSINR: 14,12,-32768,-32768,LTE"]
+        )
+        check(antEndc.map { $0.rat } == ["LTE", "NR5G"], "parseAntennaSignals: LTE ordered before NR5G in EN-DC")
+        check(rowsText(antennaRows(antSets))
+              == "PRX: RSRP -93 dBm, RSRQ -11 dB, SINR 20 dB | DRX: RSRP -110 dBm, RSRQ -16 dB, SINR 10 dB | RX2: inactive | RX3: inactive",
+              "antennaRows", rowsText(antennaRows(antSets)))
+        check(JSONSerialization.isValidJSONObject(antennasJSON(antEndc)), "antennasJSON: valid JSON")
+
+        // --- neighbour cells -------------------------------------------------------------------
+        let nbs = parseNeighbourCells([
+            "+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,14,0",
+            "+QENG: \"neighbourcell inter\",\"LTE\",100,45,-14,-105,-75,6,0",
+        ])
+        // The SINR raw, as the serving cell's: dB = raw x 2 - 20 (14 is 8 dB, 6 is -8 dB).
+        check(nbs == [
+            NeighbourCell(rat: "LTE", kind: "intra", channel: 1300, pci: 128, rsrp: -98, rsrq: -11, sinr: 8),
+            NeighbourCell(rat: "LTE", kind: "inter", channel: 100, pci: 45, rsrp: -105, rsrq: -14, sinr: -8),
+        ], "parseNeighbourCells: LTE intra and inter", "\(nbs)")
+        // The manual's example (LTE mode): an intra cell, and inter cells whose PCI and values are `-` (not valid now).
+        let manual = parseNeighbourCells([
+            "+QENG: \"neighbourcell intra\",\"LTE\",38950,276,-3,-88,-65,0,37,7,16,6,44",
+            "+QENG: \"neighbourcell inter\",\"LTE\",39148,-,-,-,-,-,37,0,30,7,-,-,-,-",
+        ])
+        check(manual == [
+            NeighbourCell(rat: "LTE", kind: "intra", channel: 38950, pci: 276, rsrp: -88, rsrq: -3, sinr: -20),
+            NeighbourCell(rat: "LTE", kind: "inter", channel: 39148, pci: nil, rsrp: nil, rsrq: nil, sinr: nil),
+        ], "parseNeighbourCells: the manual's LTE-mode example", "\(manual)")
+        // WCDMA mode: LTE cells without intra/inter, RSRP before RSRQ, no SINR; WCDMA cells as before.
+        let fromWcdma = parseNeighbourCells([
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,12,371,-95,-8,1,2,20",
+            "+QENG: \"neighbourcell\",\"LTE\",66786,301,-101,-13,22",
+        ])
+        check(fromWcdma == [
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil, sinr: nil),
+            NeighbourCell(rat: "LTE", kind: nil, channel: 66786, pci: 301, rsrp: -101, rsrq: -13, sinr: nil),
+        ], "parseNeighbourCells: WCDMA mode's LTE cells, RSRP before RSRQ", "\(fromWcdma)")
+        // LTE mode's WCDMA cells: <uarfcn>,<cell_resel_priority>,<thresh_Xhigh>,<thresh_Xlow>,<PSC>,<RSCP>,<ecno>,
+        // <srxlev>: the PSC and the RSCP after the thresholds, not the thresholds.
+        let lteModeWcdma = parseNeighbourCells([
+            "+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,14,0",
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,3,20,12,371,-95,-8,20",
+        ])
+        check(lteModeWcdma.last == NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil,
+                                                 sinr: nil),
+              "parseNeighbourCells: LTE mode's WCDMA cells, PSC and RSCP after the thresholds", "\(lteModeWcdma)")
+        // WCDMA lines alone: each told by its values (a threshold of 0 or more where WCDMA mode has the RSCP).
+        let wcdmaOnly = parseNeighbourCells([
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,3,20,12,371,-95,-8,20",
+            "+QENG: \"neighbourcell\",\"WCDMA\",10737,12,402,-101,-11,1,2,18",
+        ])
+        check(wcdmaOnly == [
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil, sinr: nil),
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10737, pci: 402, rsrp: -101, rsrq: nil, sinr: nil),
+        ], "parseNeighbourCells: WCDMA lines alone, each layout told by its values", "\(wcdmaOnly)")
+        // An LTE line without intra or inter: the answer is WCDMA mode's, its WCDMA lines read so.
+        let wcdmaModeBoth = parseNeighbourCells([
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,0,371,-95,-8,1,2,20",
+            "+QENG: \"neighbourcell\",\"LTE\",66786,301,-101,-13,22",
+        ])
+        check(wcdmaModeBoth.first == NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil,
+                                                   sinr: nil), "parseNeighbourCells: WCDMA mode told by its LTE line")
+        // A SINR that is `-`: none.
+        check(parseNeighbourCells(["+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,-,0"]).first?.sinr == nil,
+              "parseNeighbourCells: a SINR of `-` is none")
 
         print("modem network: \(checks) checks passed")
     }

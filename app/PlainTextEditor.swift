@@ -7,7 +7,9 @@
 // text storage, layout manager and container), where every edit, undo and redo included, posts
 // textDidChange; TextKit 2 does not post it for undo and redo. Text an input method is still composing
 // (marked text: pinyin, dead keys) is not committed: while there is some, the binding keeps the last
-// committed text, `composing` is true, and the view is never written to from outside.
+// committed text, `composing` is true, and the view is never written to from outside. When the view goes (another
+// conversation's field takes its place), text still being composed is committed to its own binding first, and the view
+// writes nothing after that: a binding is never written by a field that is gone.
 import AppKit
 import SwiftUI
 
@@ -24,6 +26,18 @@ struct PlainTextEditor: NSViewRepresentable {
         view.delegate = context.coordinator
         view.markedTextChanged = { [weak coordinator = context.coordinator] view in coordinator?.sync(view) }
         return scroll
+    }
+
+    /// The view goes: what an input method still composes is committed (to this field's binding, the conversation it
+    /// was typed in), `composing` ends, and the view is cut from its coordinator, so nothing it does later is written.
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        guard let view = scroll.documentView as? MessageTextView else { return }
+        if view.hasMarkedText() { view.unmarkText() }
+        coordinator.sync(view)
+        if coordinator.composing.wrappedValue { coordinator.composing.wrappedValue = false }
+        coordinator.retired = true
+        view.delegate = nil
+        view.markedTextChanged = nil
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
@@ -92,6 +106,7 @@ struct PlainTextEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
         var composing: Binding<Bool>
+        var retired = false   // its view is gone: nothing more is written
 
         init(text: Binding<String>, composing: Binding<Bool>) {
             self.text = text
@@ -106,6 +121,7 @@ struct PlainTextEditor: NSViewRepresentable {
         /// The binding takes the view's text when no input is being composed; `composing` follows the
         /// marked text.
         func sync(_ view: NSTextView) {
+            guard !retired else { return }
             let marked = view.hasMarkedText()
             if composing.wrappedValue != marked { composing.wrappedValue = marked }
             if !marked, text.wrappedValue != view.string { text.wrappedValue = view.string }

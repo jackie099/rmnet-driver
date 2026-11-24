@@ -273,6 +273,19 @@ func installTitle(_ s: DriverStatus, bundledVersion: String) -> String {
     }
 }
 
+// The Driver screen's line beside its buttons, when no advice stands above them: what this app carries against what
+// is installed, in the words of its install button (installTitle). "This app carries no driver." without one.
+func driverActionNote(_ s: DriverStatus, bundledVersion: String) -> String {
+    guard !bundledVersion.isEmpty else { return "This app carries no driver." }
+    let listed = s.entries.first(where: { !$0.uninstalling })
+    switch installTitle(s, bundledVersion: bundledVersion) {
+    case "Install": return "This app carries version \(bundledVersion)."
+    case "Update": return "This app carries version \(bundledVersion), newer than \(listed?.version ?? "the one installed")."
+    case "Reinstall": return "This app carries the version installed, \(bundledVersion)."
+    default: return "This app carries version \(bundledVersion), older than \(listed?.version ?? "the one installed")."
+    }
+}
+
 // Whether the listing read again after an installation of `version` shows it installed: exactly one
 // entry, of that version (compared as installTitle compares, so 317.9 and 317.9.0 are the same
 // version), enabled.

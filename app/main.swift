@@ -1,15 +1,18 @@
 // RMNet host app: installs, removes and reports on the RMNet driver extension, reads and sends the
 // modem's text messages, and shows and changes the modem's network and settings.
 // Usage: RMNet activate | deactivate | status [--json]
-//        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
+//        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>... | sms unblock [seconds] [--json]
 //        RMNet gps [seconds] [--keep-on]
-//        RMNet network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
+//        RMNet network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
-//        RMNet sim [--json] | sim unlock [--last-attempt]
+//        RMNet sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes]
 //        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
 //        RMNet at [--timeout <seconds>] <command>
 //        RMNet bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]
+//        RMNet cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>]
+//        RMNet cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off
+//        RMNet imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps
@@ -145,33 +148,6 @@ func runStatus(_ manager: ExtensionManager, json: Bool) {
 // The sms verbs take no part in the system-extension machinery: they talk to the modem's spare AT
 // port off the main thread, print, and exit. Message text and numbers go only to standard output.
 
-enum SmsCommand {
-    case list(json: Bool)
-    case send(number: String, text: String)
-    case delete(indices: [Int])
-}
-
-// The words after "sms"; nil for wrong usage.
-func parseSms(_ words: [String]) -> SmsCommand? {
-    guard let verb = words.first else { return nil }
-    let rest = Array(words.dropFirst())
-    switch verb {
-    case "list":
-        if rest.isEmpty { return .list(json: false) }
-        return rest == ["--json"] ? .list(json: true) : nil
-    case "send":
-        guard rest.count >= 2 else { return nil }
-        return .send(number: rest[0], text: rest.dropFirst().joined(separator: " "))
-    case "delete":
-        let indices = rest.compactMap { Int($0) }.filter { $0 >= 0 }
-        guard !rest.isEmpty, indices.count == rest.count else { return nil }
-        var seen = Set<Int>()
-        return .delete(indices: indices.filter { seen.insert($0).inserted })  // each once, first kept
-    default:
-        return nil
-    }
-}
-
 let localTimeFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -184,39 +160,26 @@ let localTimeFormatter: DateFormatter = {
 func localTime(_ date: Date) -> String { localTimeFormatter.string(from: date) }
 
 func printMessages(_ listing: SmsListing) {
-    let messages = listing.messages
-    print(listHeadline(count: messages.count, used: listing.used, total: listing.total))
-    let warning = storeWarning(used: listing.used, total: listing.total)
-    if !warning.isEmpty { print("sms: \(warning)") }
-    for m in messages {
-        let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
-        guard m.readable else {
-            print("\(indices) not readable")
-            continue
-        }
-        var head = "\(indices) \(m.unread ? "unread" : "read") \(m.sender) \(m.timestamp.map(localTime) ?? "no time")"
-        if m.missingParts > 0 { head += " (\(m.missingParts) part(s) missing)" }
-        print(head)
-        if m.text.isEmpty { continue }
-        for line in m.text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
-            print("  \(line)")
-        }
-    }
+    for line in smsListLines(listing, time: localTime) { print(line) }
 }
 
-func printMessagesJSON(_ messages: [SmsMessage]) {
+func printMessagesJSON(_ listing: SmsListing) {
     let iso = ISO8601DateFormatter()
     iso.timeZone = .current
-    let array: [[String: Any]] = messages.map { m in
-        ["indices": m.indices, "unread": m.unread, "sender": m.sender,
-         "time": m.timestamp.map { iso.string(from: $0) } ?? NSNull(), "text": m.text,
-         "missingParts": m.missingParts, "readable": m.readable]
-    }
+    let array = smsListJSON(listing, time: { iso.string(from: $0) })
     if array.isEmpty {
         print("[]")
         return
     }
     let data = try! JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+func printUnblockedJSON(_ result: SmsUnblocked) {
+    let iso = ISO8601DateFormatter()
+    iso.timeZone = .current
+    let object = smsUnblockJSON(result, time: { iso.string(from: $0) })
+    let data = try! JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
 }
 
@@ -227,7 +190,7 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
     case .list(let json):
         switch service.list() {
         case .success(let listing):
-            if json { printMessagesJSON(listing.messages) } else { printMessages(listing) }
+            if json { printMessagesJSON(listing) } else { printMessages(listing) }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
@@ -239,11 +202,21 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
         // multi-part send.
         for sig in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT] { signal(sig, SIG_IGN) }
         switch service.send(to: number, text: text) {
-        case .success(let parts):
-            print("sms: sent to \(number) in \(parts) part(s)")
+        case .success(let sent):
+            print("sms: sent to \(number) in \(sent.parts) part(s)")
+            if !sent.stored {
+                print("sms: not stored: the modem writes messages to another storage than the one it lists (AT+CPMS)")
+            }
+            // Sent, and what is kept of it on the modem and in the record of sent messages, apart.
+            for note in smsArchiveNotes(sent.record) { print("sms: \(note)") }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
+            for note in smsArchiveNotes(failure.record) { print("sms: \(note)") }
+            if failure.reachedModem {
+                print("sms: do not send the whole text again: parts of it went, may have gone, or are stored on the "
+                      + "modem as unsent (the window's Retry sends only those)")
+            }
             return 1
         }
     case .delete(let indices):
@@ -253,6 +226,42 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
+            return 1
+        }
+    case .unblock(let seconds, let json):
+        // Ctrl-C, SIGTERM and SIGHUP let the current 1 s slice finish (restoring AT+CNMI=2,1,0,0,0 and storing any
+        // PDU already received), then end the verb by that signal; SIGTSTP is ignored so Ctrl-Z cannot suspend the
+        // process while AT+CNMI is 2,2.
+        signal(SIGPIPE, SIG_IGN)
+        signal(SIGTSTP, SIG_IGN)
+        let stopLock = NSLock()
+        var stopSignal: Int32? = nil
+        let watch = SignalWatch([SIGINT, SIGTERM, SIGHUP, SIGQUIT]) { sig in
+            stopLock.lock()
+            if stopSignal == nil { stopSignal = sig }
+            stopLock.unlock()
+        }
+        defer { watch.stop() }
+        let outcome = service.unblock(seconds: seconds, shouldStop: {
+            stopLock.lock()
+            defer { stopLock.unlock() }
+            return stopSignal != nil
+        })
+        stopLock.lock()
+        let caught = stopSignal
+        stopLock.unlock()
+        switch outcome {
+        case .success(let unblocked):
+            if json {
+                printUnblockedJSON(unblocked)
+            } else {
+                for line in smsUnblockLines(unblocked, seconds: seconds, time: localTime) { print(line) }
+            }
+            if let sig = caught { dieBySignal(sig) }
+            return 0
+        case .failure(let failure):
+            print("sms: \(failure.message)")
+            if let sig = caught { dieBySignal(sig) }
             return 1
         }
     }
@@ -271,7 +280,7 @@ if verbs.isEmpty {
     exit(0)
 }
 
-let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds] [--keep-on] | \(modemUsage)"
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | sms unblock [seconds] [--json] | gps [seconds] [--keep-on] | \(modemUsage)"
 
 if verbs.first == "sms" {
     guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {
@@ -331,7 +340,8 @@ if let verb = verbs.first, modemVerbs.contains(verb) {
                             readSecret: { prompt in DispatchQueue.main.sync { readSecret(prompt: prompt) } },
                             ask: { question in DispatchQueue.main.sync { askOnTerminal(question) } },
                             output: { print($0); fflush(stdout) },
-                            errorOutput: { fputs("\($0)\n", stderr) })
+                            errorOutput: { fputs("\($0)\n", stderr) },
+                            imeiHistory: ImeiHistoryRecorder(keeper: ImeiHistoryFile.standard, module: { readModemSerial() }))
         fflush(stdout)
         exit(code)
     }

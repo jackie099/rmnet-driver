@@ -5,7 +5,9 @@
 // is closed. Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
+import notify
 import SwiftUI
+import UserNotifications
 
 struct RMNetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -15,7 +17,8 @@ struct RMNetApp: App {
             RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice,
                         modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice,
                         driverStatus: appDelegate.driverStatus, throughput: appDelegate.throughput,
-                        menuBar: appDelegate.menuBar, polls: appDelegate.windowPolls)
+                        menuBar: appDelegate.menuBar, polls: appDelegate.windowPolls,
+                        router: appDelegate.router, simWatcher: appDelegate.simWatcher)
         }
         .defaultSize(width: 920, height: 640)
         .windowResizability(.contentMinSize)
@@ -23,13 +26,18 @@ struct RMNetApp: App {
         // delegate), so a change of the icon redraws only the label.
         MenuBarExtra {
             MenuBarPanel(status: appDelegate.menuBar, quitNotice: appDelegate.messages.quitNotice,
-                         modemQuitNotice: appDelegate.modem.quitNotice,
-                         showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
+                         modemQuitNotice: appDelegate.modem.quitNotice, unread: appDelegate.messages.unreadNotice,
+                         showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) },
+                         showMessages: { appDelegate.router.request = .messages })
                 .background(OpenWindowKeeper())
         } label: {
             MenuBarLabel(status: appDelegate.menuBar)
         }
         .menuBarExtraStyle(.window)
+        // Cmd-, and the gear in the item's panel: the menu bar icon, the SIM slots, the notifications (SettingsView.swift).
+        Settings {
+            SettingsView(menuBar: appDelegate.menuBar, settings: appDelegate.settings)
+        }
     }
 }
 
@@ -51,6 +59,8 @@ struct RMNetWindow: View {
     let throughput: ThroughputSampler
     let menuBar: MenuBarStatus
     let polls: WindowPolls
+    @ObservedObject var router: WindowRouter
+    let simWatcher: SimSlotWatcher
     @SceneStorage("screen") private var screen = Screen.overview
 
     var body: some View {
@@ -76,8 +86,13 @@ struct RMNetWindow: View {
         }
         // The window's minimum is 760 × 520 with its toolbar (about 52 pt): this frame is below the toolbar.
         .frame(minWidth: 760, minHeight: 468)
-        .onAppear { show(screen) }
+        .onAppear {
+            takeRequest()
+            show(screen)
+        }
         .onChange(of: screen) { _, shown in show(shown) }
+        // A notification's click (or the panel's unread line) asks for a screen.
+        .onChange(of: router.request) { _, _ in takeRequest() }
         .onDisappear {
             messages.setTabShown(false)
             modem.setTabShown(nil)
@@ -94,6 +109,12 @@ struct RMNetWindow: View {
         .background(OpenWindowKeeper())
     }
 
+    private func takeRequest() {
+        guard let wanted = router.request else { return }
+        router.request = nil
+        screen = wanted
+    }
+
     /// Tells the controllers and the polls what the screen shown reads.
     private func show(_ shown: Screen) {
         messages.setTabShown(shown.listsMessages)
@@ -105,13 +126,13 @@ struct RMNetWindow: View {
         switch shown {
         case .overview:
             OverviewView(driverStatus: driverStatus, modem: modem, messages: messages, throughput: throughput,
-                         navigate: { screen = $0 })
+                         simWatcher: simWatcher, navigate: { screen = $0 })
         case .messages:
             SmsView(controller: messages)
         case .network:
             NetworkTab(controller: modem, throughput: throughput)
         case .simData:
-            SimApnTab(controller: modem)
+            SimApnTab(controller: modem, simWatcher: simWatcher)
         case .driver:
             StatusView(controller: driverStatus)
         }
@@ -262,7 +283,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service: SmsService(),
         queue: AppDelegate.modemQueue,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
-        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
+        backgroundService: SmsService(waitForPort: false),
+        notifyEnabled: { [unowned self] in self.settings.notifyMessages },
+        autoUnblockEnabled: { [unowned self] in self.settings.smsAutoUnblock },
+        hasRescued: { AtPort.hasRescuedDeliveries },
+        alert: { [unowned self] alert in self.notifier.post(alert) })
+
+    // The settings besides the menu bar icon's (AppSettings.swift), the screen a click asks the window for, and the
+    // notifications for new messages (MessageNotifier.swift).
+    private(set) lazy var settings = AppSettings(defaults: .standard)
+    private(set) lazy var router = WindowRouter()
+    private lazy var notifier = MessageNotifier()
+
+    // Switching SIM slots by itself (SimSlotWatch.swift), with the modem screens' controller.
+    private(set) lazy var simWatcher = SimSlotWatcher(
+        enabled: { [unowned self] in self.settings.simAutoSwitch },
+        module: { readModemSerial() },
+        switchSlot: { [unowned self] slot, expect, done in
+            self.modem.changeSimSlot(slot, automatic: true, expect: expect, completion: done)
+        })
+
+    // The background turn over the AT port, every 15 s while the app runs (ModemPulse.swift): the signal bars, the
+    // check for new messages and the SIM slot watcher, in one port open that does not wait for another program.
+    private lazy var pulse: ModemPulse = {
+        let service = ModemService(open: { AtPort.openWithoutWaiting().map { $0 as AtCommanding } })
+        let p = ModemPulse(queue: AppDelegate.modemQueue, read: { service.shortReads($0) })
+        p.add(ModemPulse.Rider(commands: { [unowned self] _ in self.menuBar.pulseSignalCommands() },
+                               deliver: { [unowned self] in self.menuBar.pulseSignalAnswers($0) }))
+        p.add(ModemPulse.Rider(commands: { [unowned self] turn in
+                                   self.menuBar.modemOnUsb ? self.messages.pulseCommands(turn: turn) : [] },
+                               deliver: { [unowned self] in self.messages.pulseAnswers($0) }))
+        p.add(ModemPulse.Rider(commands: { [unowned self] _ in self.simWatcher.pulseCommands() },
+                               deliver: { [unowned self] in self.simWatcher.pulseAnswers($0) }))
+        return p
+    }()
+    private var watchers: [AnyCancellable] = []
+    private var blockedNotifyToken: Int32 = -1
 
     // The process's one ModemController, for the Overview, Network and SIM & Data screens, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
@@ -270,11 +327,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         queue: AppDelegate.modemQueue,
         driverProfile: driverProfileNumber,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
-        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
+        imeiHistory: ImeiHistoryRecorder(keeper: ImeiHistoryFile.standard, module: { readModemSerial() }))
 
     // The menu bar item's state, polled from launch (applicationDidFinishLaunching) for as long as the app runs.
     // Kept here rather than in the App, so that only the item's label and panel observe it.
-    private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
+    // With the signal bars chosen, the window's network read (the Overview's and the Network screen's, every 5 s while
+    // shown) stands in for the bars' own read while it is under 15 s old.
+    private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue, freshInfo: {
+        [unowned self] in
+        guard let info = self.modem.info, let at = self.modem.infoAt else { return nil }
+        return (info, at)
+    })
 
     // The driver's status, shared by the Overview and the Driver screen, and the throughput, shared by the Overview
     // and the Network screen; each polled by `windowPolls` only while one of its screens is shown and the window
@@ -288,6 +352,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBar.start()
+        // A modem that comes onto USB (or is there now) is watched for an empty SIM slot, and checked once for CNMI.
+        watchers.append(menuBar.$modemOnUsb.sink { [unowned self] present in
+            self.simWatcher.modemPresent(present)
+            self.messages.modemPresent(present)
+        })
+        watchers.append(settings.$smsAutoUnblock.sink { [unowned self] enabled in
+            self.messages.autoUnblockSettingChanged(enabled)
+        })
+        AtPort.setBlockedSmsHandler { [weak self] in
+            DispatchQueue.main.async { self?.messages.blockedSmsSeen() }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: AtPort.blockedSmsNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.messages.blockedSmsSeen()
+        }
+        var token: Int32 = -1
+        if notify_register_dispatch(AtPort.blockedSmsNotifyKey, &token, .main, { [weak self] _ in
+            self?.messages.blockedSmsSeen()
+        }) == NOTIFY_STATUS_OK {
+            blockedNotifyToken = token
+        }
+        UNUserNotificationCenter.current().delegate = notifier
+        notifier.open = { [unowned self] in
+            self.router.request = .messages
+            _ = AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
+        }
+        pulse.start()
     }
 
     // Both controllers are asked at once when the app is to quit, since a call of one can wait behind a call
@@ -362,6 +453,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// The screen asked for from outside the window (a notification's click, the menu bar panel's unread line): the window
+/// shows it and clears the request, also when it opens later.
+final class WindowRouter: ObservableObject {
+    @Published var request: Screen? = nil
+}
+
 // What the window knows of the system's listing.
 enum ListingState {
     case asking            // no answer yet since the window opened
@@ -377,9 +474,29 @@ final class StatusController: ObservableObject {
     @Published private(set) var status = DriverStatus(entries: [], modem: .absent, attached: false, properties: [:])
     @Published private(set) var listing = ListingState.asking
     @Published private(set) var busy = false
+    // The request's words while it runs, then its result: the Driver screen's banner (and the Overview's line under its
+    // Driver card). Dismissed, it is cleared; a success goes by itself (ResultLine.swift).
     @Published private(set) var progress = ""
+    @Published private(set) var progressKind = ResultKind.success
+    private lazy var expiry = ResultExpiry(after: mainRunLoopAfter, clear: { [weak self] in self?.say("", .success) })
 
-    let bundledVersion = bundledDriverVersion() ?? ""
+    /// The banner's X: the line is cleared, so it does not come back on another screen or a new window.
+    func dismissResult() {
+        say("", .success)
+    }
+
+    /// The pointer on the banner (true) or off it: a success does not go while it is on it.
+    func hoverResult(_ on: Bool) {
+        expiry.hover(on)
+    }
+
+    private func say(_ text: String, _ kind: ResultKind) {
+        progress = text
+        progressKind = kind
+        expiry.shown(text, kind)
+    }
+
+    private(set) var bundledVersion = bundledDriverVersion() ?? ""
     private let manager = ExtensionManager()
     private var entries: [ExtensionEntry] = []
     private var asking = false  // a properties request is in flight (at most 10 s)
@@ -422,37 +539,39 @@ final class StatusController: ObservableObject {
     // progress line says why.
     func install() {
         guard installEnabled else {
-            progress = notSentText(action: installButtonTitle, busy: busy, known: known)
+            say(notSentText(action: installButtonTitle, busy: busy, known: known), .failure)
             return
         }
         let updating = !status.entries.isEmpty
         let version = bundledVersion
         busy = true
-        progress = "Asking the system to install version \(version)…"
+        say("Asking the system to install version \(version)…", .progress)
         manager.activate(
-            replacing: { [weak self] old, new in self?.progress = "Replacing version \(old) with version \(new)…" },
+            replacing: { [weak self] old, new in self?.say("Replacing version \(old) with version \(new)…", .progress) },
             needsApproval: { [weak self] in
-                self?.progress = "Waiting for approval in System Settings, General, Login Items & Extensions, Driver Extensions."
+                self?.say("Waiting for approval in System Settings, General, Login Items & Extensions, Driver Extensions.",
+                          .progress)
             },
             completion: { [weak self] outcome in
                 guard let self = self else { return }
                 guard case .completed = outcome else {
-                    self.finish(self.answer(outcome, request: "installation of version \(version)"))
+                    self.finish(self.answer(outcome, request: "installation of version \(version)"), self.kind(outcome))
                     return
                 }
-                self.progress = "The system accepted version \(version); reading the listing again…"
+                self.say("The system accepted version \(version); reading the listing again…", .progress)
                 self.manager.properties(timeout: 10) { answer in
                     guard case .listed(let found) = answer else {
-                        self.finish("The system accepted version \(version), but did not list the driver afterwards.")
+                        self.finish("The system accepted version \(version), but did not list the driver afterwards.",
+                                    .warning)
                         return
                     }
                     let now = found.map(ExtensionEntry.init)
                     if installConfirmed(now, version: version) {
                         self.finish(updating
                             ? "Version \(version) is installed. It loads when the modem is next plugged in or the Mac restarts; until then the old build may still be attached."
-                            : "Version \(version) is installed.")
+                            : "Version \(version) is installed.", updating ? .warning : .success)
                     } else {
-                        self.finish("The system accepted version \(version); it now lists \(describeListing(now)).")
+                        self.finish("The system accepted version \(version); it now lists \(describeListing(now)).", .warning)
                     }
                 }
             })
@@ -460,38 +579,47 @@ final class StatusController: ObservableObject {
 
     func remove() {
         guard removeEnabled else {
-            progress = notSentText(action: "Remove", busy: busy, known: known)
+            say(notSentText(action: "Remove", busy: busy, known: known), .failure)
             return
         }
         let version = bundledVersion
         busy = true
         manager.remove(
             status: status, bundledVersion: version,
-            step: { [weak self] text in self?.progress = text },
+            step: { [weak self] text in self?.say(text, .progress) },
             completion: { [weak self] result in
                 guard let self = self else { return }
                 switch result {
                 case .notSent(let why):
-                    self.finish("Nothing was sent. " + why)
+                    self.finish("Nothing was sent. " + why, .failure)
                 case .activationEnded(.willCompleteAfterReboot):
-                    self.finish("The system will install version \(version) after a restart; press Remove again then. Nothing was removed.")
+                    self.finish("The system will install version \(version) after a restart; press Remove again then. Nothing was removed.",
+                                .warning)
                 case .activationEnded(let outcome):
                     self.finish(self.answer(outcome, request: "installation of version \(version) that comes first")
-                                + " Nothing was removed.")
+                                + " Nothing was removed.", .failure)
                 case .listingAfterActivation(let what):
-                    self.finish("The system accepted version \(version) first, but then \(what), so the removal was not asked for. Nothing was removed.")
+                    self.finish("The system accepted version \(version) first, but then \(what), so the removal was not asked for. Nothing was removed.",
+                                .failure)
                 case .deactivation(.completed):
-                    self.finish("The system accepted the removal. The driver keeps the modem's network port until the modem is unplugged or the Mac restarts.")
+                    self.finish("The system accepted the removal. The driver keeps the modem's network port until the modem is unplugged or the Mac restarts.",
+                                .warning)
                 case .deactivation(let outcome):
-                    self.finish(self.answer(outcome, request: "removal"))
+                    self.finish(self.answer(outcome, request: "removal"), self.kind(outcome))
                 }
             })
     }
 
-    private func finish(_ text: String) {
-        progress = text
+    private func finish(_ text: String, _ kind: ResultKind) {
         busy = false
+        say(text, kind)
         refresh()
+    }
+
+    // A request the system did not complete: a warning when it completes after a restart, else a failure.
+    private func kind(_ outcome: RequestOutcome) -> ResultKind {
+        if case .willCompleteAfterReboot = outcome { return .warning }
+        return .failure
     }
 
     private func words(_ outcome: RequestOutcome) -> String {

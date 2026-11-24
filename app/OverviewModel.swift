@@ -41,11 +41,21 @@ func servingSignalHistory(_ samples: [SignalSample], until: Date? = nil, window:
 
 /// The sparkline's place while it has under two values: "No signal" when the last read says there is none (the
 /// radio off, or no serving leg: a read with no leg adds nothing to the history), "No signal data" after two reads
-/// without a value, else "Collecting…".
-func signalPlaceholder(_ info: NetworkInfo?, _ history: ServingSignalHistory) -> String {
+/// without a value or while the reads fail with nothing read before (`failure`: the last read's; the hero says why),
+/// else "Collecting…".
+func signalPlaceholder(_ info: NetworkInfo?, _ history: ServingSignalHistory, failure: String? = nil) -> String {
     if let info, info.serving.flatMap({ servingLeg($0.cells) }) == nil, signalLevel(info) == 0 { return "No signal" }
     if history.values.isEmpty && history.reads >= 2 { return "No signal data" }
+    if info == nil && failure != nil { return "No signal data" }
     return "Collecting…"
+}
+
+/// The hero's lock badge: what the modem is locked to, as the Network screen last read it (NetworkCards.lockParts:
+/// the cell lock, then each RAT whose bands are locked), the first in words and how many more ("Locked: 5G SA cell
+/// n41 · PCI 186 +1"); nil when nothing is locked or it was not read.
+func heroLockText(_ parts: [String]) -> String? {
+    guard let first = parts.first else { return nil }
+    return "Locked: \(first)" + (parts.count > 1 ? " +\(parts.count - 1)" : "")
 }
 
 /// The signal card's number: the serving leg's RSRP now (nil when the last read has no leg), the metric's name on
@@ -85,7 +95,8 @@ struct SimSummary: Equatable {
 }
 
 /// The SIM as the SIM & Data screen last read it (nil: not read): ready; PIN required (Unlock…); blocked, not
-/// inserted or failed (attention); another state in its own words (simStateWords); each but ready with a button.
+/// inserted or failed (attention); another state in its own words (simStateWords); each with a button, so the three
+/// small cards end alike (Open SIM & Data, or Unlock… for a PIN).
 func simSummary(_ sim: SimInfo?) -> SimSummary {
     guard let sim else {
         return SimSummary(state: CardState(text: "Not checked yet", symbol: "questionmark.circle", tone: .neutral),
@@ -93,7 +104,8 @@ func simSummary(_ sim: SimInfo?) -> SimSummary {
     }
     switch sim.state {
     case .ready:
-        return SimSummary(state: CardState(text: "Ready", symbol: "checkmark.circle.fill", tone: .good), action: nil)
+        return SimSummary(state: CardState(text: "Ready", symbol: "checkmark.circle.fill", tone: .good),
+                          action: "Open SIM & Data")
     case .pin:
         return SimSummary(state: CardState(text: "PIN required", symbol: "lock.fill", tone: .attention),
                           action: "Unlock…")
@@ -135,7 +147,7 @@ struct DriverSummary: Equatable {
 /// listing is known, and the app's bundled version.
 /// - The driver is fine (Connected, Connecting, Link down, modem not attached): an update bundled (the Driver
 ///   screen's button reads Update and may be pressed) is orange with Update; else green, Running while attached,
-///   Enabled otherwise.
+///   Enabled otherwise, with Details (the Driver screen), so the three small cards end alike.
 /// - Otherwise the hero's pill's words (connectionPill), so the two always agree: Checking… (neutral); Status unknown
 ///   (red, Details); and in orange: Not installed (Install; the Overview shows its empty state then), Waiting for
 ///   approval (Open System Settings), Not in QMI mode (the advice's first sentence and its commands, Details),
@@ -156,7 +168,7 @@ func driverSummary(headline: String, status: DriverStatus, known: Bool, bundledV
         }
         return DriverSummary(state: CardState(text: status.attached ? "Running" : "Enabled",
                                               symbol: "checkmark.circle.fill", tone: .good),
-                             version: version)
+                             version: version, action: .details, actionTitle: "Details")
     case "Asking the system…":
         return DriverSummary(state: CardState(text: words, symbol: "circle.dotted", tone: .neutral), version: version)
     case unknownHeadline:

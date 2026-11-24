@@ -36,8 +36,10 @@ let saInfo: NetworkInfo = {
                                               cs: parseRegistrationStat(["+CREG: 0,0"], prefix: "+CREG"))
     info.serving = parseServingCell(
         ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",460,00,123456789,32,1A2B3C,504990,41,12,-95,-10,8,1,-"])
-    info.carriers = parseCarriers(["+QCAINFO: \"PCC\",504990,12,\"NR5G BAND 41\",32",
-                                   "+QCAINFO: \"SCC\",155770,3,\"NR5G BAND 28\",1,6,0,-,-"])
+    let qca = ["+QCAINFO: \"PCC\",504990,12,\"NR5G BAND 41\",32",
+               "+QCAINFO: \"SCC\",155770,3,\"NR5G BAND 28\",1,6,0,-,-"]
+    info.carriers = parseCarriers(qca)
+    info.carrierComponents = parseCarrierComponents(qca)
     info.mode = parseModePreference(["+QNWPREFCFG: \"mode_pref\",AUTO"])
     info.nr5gDisable = parseNr5gDisable(["+QNWPREFCFG: \"nr5g_disable_mode\",0"])
     return info
@@ -58,6 +60,10 @@ let listed = parseProfiles([
     "+CGDCONT: 4,\"IPV4V6\",\"CMWAP\",\"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0\",0,0,0,0,,,,,,,,,,\"\",,,,0",
     "+CGDCONT: 5,\"IPV4V6\",\"SOS\",\"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0\",0,0,0,1,,,,,,,,,,\"\",,,,0",
 ])
+
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
 
 func settings(_ apn: String, password: String = "") -> ProfileSettings {
     ProfileSettings(type: .ipv4v6, apn: apn, user: "", password: password, auth: .none)
@@ -118,6 +124,28 @@ final class FakeModem: ModemServing {
     var atResult: Result<[String], ModemFailure> = .success([])
     var bandsResult: Result<[BandSet], ModemFailure> = .success(bandSets())
     var setBandsResults: [BandRat: Result<BandChange, ModemFailure>] = [:]   // none: from the allowed list to the one asked
+    var antennasResult: Result<[AntennaSignalSet], ModemFailure> = .success([
+        AntennaSignalSet(rat: "NR5G", ports: [
+            AntennaPort(index: 0, name: "PRX", rsrp: -93, rsrq: -11, sinr: 20),
+            AntennaPort(index: 1, name: "DRX", rsrp: -110, rsrq: -16, sinr: 10),
+            AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+            AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+        ])
+    ])
+    var cellLockResult: Result<CellLockState, ModemFailure> = .success(
+        CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false))
+    var setNrLockResult: Result<CellLockChange, ModemFailure>? = nil
+    var setLteLockResult: Result<CellLockChange, ModemFailure>? = nil
+    var setPersistResult: Result<CellLockChange, ModemFailure>? = nil
+    var imeiResult: Result<String, ModemFailure> = .success("000000000000091")
+    var setImeiResult: Result<ImeiChange, ModemFailure>? = nil
+    var sessionModule: String? = "c0ffee01"     // the module setImei's own port open is on
+    var readingModule: String? = "c0ffee01"     // the module imeiReading's port open is on (what is confirmed)
+    var imeiExpectAsked: [ImeiExpectation?] = []
+    var sessionBefore: String? = nil            // the IMEI it reads before the write (nil: imeiResult's)
+    var simSlotResult: Result<Int, ModemFailure> = .success(1)
+    var setSimSlotResult: Result<SimSlotChange, ModemFailure>? = nil
+    var simSlotsAsked: [(slot: Int, wait: SimSlotWait)] = []
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
@@ -126,10 +154,20 @@ final class FakeModem: ModemServing {
     var usbModesSet: [String] = []                                    // "<mode> reboot" or "<mode> no reboot"
     var atSent: [String] = []                                         // "<line> <timeout>"
     var bandsAsked: [String] = []                                     // "<rat> <bands joined by :>"
+    var nrLockSet: [NrCellLock?] = []
+    var lteLockSet: [[LteLockedCell]] = []
+    var persistSet: [(Bool, Bool)] = []
+    var cellsInUse: [CellInUse] = []
+    var lockCellInUseResult: Result<CellLockChange, ModemFailure>? = nil
+    var imeiSetAsked: [(imei: String, reboot: Bool)] = []
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
         events.append("networkInfo")
         return networkResult
+    }
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> {
+        events.append("antennas")
+        return antennasResult
     }
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> {
         events.append("setRadio")
@@ -186,6 +224,92 @@ final class FakeModem: ModemServing {
         let before = (try? bandsResult.get())?.first(where: { $0.rat == rat })?.allowed ?? []
         return .success(BandChange(before: before, after: bands))
     }
+    func cellLock() -> Result<CellLockState, ModemFailure> {
+        events.append("cellLock")
+        return cellLockResult
+    }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> {
+        events.append("setNrCellLock")
+        nrLockSet.append(lock)
+        if let r = setNrLockResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: before.lte, nr: lock, persistLte: before.persistLte, persistNr: before.persistNr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> {
+        events.append("setLteCellLock")
+        lteLockSet.append(cells)
+        if let r = setLteLockResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: cells, nr: before.nr, persistLte: before.persistLte, persistNr: before.persistNr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    // As the service: the serving cell (networkResult's) checked by cellInUseLock, then locked as setNrCellLock or
+    // setLteCellLock does here.
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> {
+        events.append("lockCellInUse")
+        cellsInUse.append(cell)
+        if let r = lockCellInUseResult { return r }
+        if let problem = cellInUseProblem(cell) { return .failure(ModemFailure(message: "\(problem) Nothing was changed.")) }
+        let info = (try? networkResult.get()) ?? NetworkInfo()
+        switch cellInUseLock(cell, serving: info.serving, carriers: info.carrierComponents) {
+        case .refused(let why): return .failure(ModemFailure(message: "\(why) Nothing was changed."))
+        case .nr(let lock): return setNrCellLock(lock)
+        case .lte(let one): return setLteCellLock([one])
+        }
+    }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> {
+        events.append("setCellLockPersist")
+        persistSet.append((lte, nr))
+        if let r = setPersistResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: before.lte, nr: before.nr, persistLte: lte, persistNr: nr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    func imei() -> Result<String, ModemFailure> {
+        events.append("imei")
+        return imeiResult
+    }
+    func imeiReading() -> Result<ImeiReading, ModemFailure> {
+        events.append("imeiReading")
+        return imeiResult.map { ImeiReading(imei: $0, module: readingModule) }
+    }
+    func simSlot() -> Result<Int, ModemFailure> {
+        events.append("simSlot")
+        return simSlotResult
+    }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
+        events.append("setSimSlot")
+        simSlotsAsked.append((slot: slot, wait: wait))
+        if let r = setSimSlotResult { return r }
+        let before = (try? simSlotResult.get()) ?? 1
+        if before == slot { return .success(SimSlotChange(before: slot, after: slot)) }
+        return .success(SimSlotChange(before: before, after: slot, sim: .ready, secondsToSim: 2,
+                                      registration: Registration(status: .home, domain: "5GS"), secondsToRegister: 5))
+    }
+    /// The module and the IMEI before that the change's own port open reads (ImeiWrite): `sessionModule`, and the IMEI
+    /// `imeiResult` gives (or `sessionBefore` when set). An expectation they do not meet writes nothing, as the service.
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite {
+        events.append("setImei")
+        imeiSetAsked.append((imei: imei, reboot: reboot))
+        imeiExpectAsked.append(expect)
+        let before = sessionBefore ?? (try? imeiResult.get()) ?? "000000000000091"
+        if let expect, sessionModule != expect.module {
+            return ImeiWrite(outcome: .failure(ModemFailure(message: "The modem attached is not the module this change "
+                                                            + "was confirmed for. Nothing was changed.")),
+                             module: sessionModule)
+        }
+        if let expect, before != expect.before {
+            return ImeiWrite(outcome: .failure(ModemFailure(message: "The modem's IMEI is \(before) now, not "
+                                                            + "\(expect.before) as when the change was confirmed. Nothing was changed.")),
+                             module: sessionModule, before: before)
+        }
+        if let r = setImeiResult { return ImeiWrite(outcome: r, module: sessionModule, before: before) }
+        if before == imei { return ImeiWrite(outcome: .success(.unchanged(before)), module: sessionModule, before: before) }
+        return ImeiWrite(outcome: .success(reboot ? .rebooting(before: before, after: imei)
+                                                  : .setTakesEffectAfterRestart(before: before, after: imei)),
+                         module: sessionModule, before: before)
+    }
 }
 
 /// One run of a verb: what it printed on standard output (`lines`) and on standard error (`errors`), its
@@ -202,7 +326,7 @@ struct Run {
 /// the terminal's question `answer` (nil: no terminal).
 @discardableResult
 func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAnswer: String? = nil,
-         answer: String? = nil, _ name: String) -> Run {
+         answer: String? = nil, history: ImeiHistoryRecorder? = nil, _ name: String) -> Run {
     guard let command = parseModem(words) else {
         check(false, "\(name): \(words.joined(separator: " ")) parses")
         return Run(lines: [], code: -1, prompts: [])
@@ -229,7 +353,8 @@ func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAn
                         errorOutput: { line in
                             fake.events.append("error")
                             errors.append(line)
-                        })
+                        },
+                        imeiHistory: history)
     return Run(lines: lines, code: code, prompts: prompts, questions: questions, errors: errors)
 }
 
@@ -302,19 +427,53 @@ let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6
 struct ModemCliTests {
     static func main() {
         // --- the verbs and the usage -------------------------------------------------------------
-        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"], "modemVerbs",
-              "\(modemVerbs.sorted())")
-        check(modemUsage == "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
-              + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-              + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+        check(modemVerbs == ["network", "antennas", "radio", "mode", "apn", "sim", "usbmode", "at", "bands",
+                             "cell", "imei"], "modemVerbs", "\(modemVerbs.sorted())")
+        check(modemUsage == "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
+              + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
+              + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
+              + "sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes] | "
               + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
               + "at [--timeout <seconds>] <command> | "
-              + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]",
+              + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
+              + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>] | "
+              + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
+              + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
         expectParse(["network"], .network(json: false))
         expectParse(["network", "--json"], .network(json: true))
+        expectParse(["antennas"], .antennas(json: false))
+        expectParse(["antennas", "--json"], .antennas(json: true))
+        expectParse(["cell"], .cellShow(json: false))
+        expectParse(["cell", "--json"], .cellShow(json: true))
+        expectParse(["cell", "lock", "current"], .cellLockCurrent(scsKHz: nil))
+        expectParse(["cell", "lock", "current", "--scs", "30"], .cellLockCurrent(scsKHz: 30))
+        for words in [["cell", "lock", "current", "--scs"], ["cell", "lock", "current", "--scs", "x"],
+                      ["cell", "lock", "current", "--scs", "30", "extra"], ["cell", "lock", "current", "30"],
+                      ["cell", "lock", "current", "--scs", "-15"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
+        expectParse(["cell", "lock", "sa", "147", "520110", "30", "n41"],
+                    .cellLockNr(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)))
+        expectParse(["cell", "lock", "lte", "1300:128,100:45"],
+                    .cellLockLte([LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45)]))
+        expectParse(["cell", "unlock"], .cellUnlock(.both))
+        expectParse(["cell", "unlock", "sa"], .cellUnlock(.sa))
+        expectParse(["cell", "unlock", "lte"], .cellUnlock(.lte))
+        expectParse(["cell", "persist", "on"], .cellPersist(true))
+        expectParse(["cell", "persist", "off"], .cellPersist(false))
+        expectParse(["imei"], .imeiShow(json: false))
+        expectParse(["imei", "history"], .imeiHistory(json: false))
+        expectParse(["imei", "history", "--json"], .imeiHistory(json: true))
+        for words in [["imei", "history", "x"], ["imei", "history", "--json", "--json"], ["imei", "history", "--yes"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
+        expectParse(["imei", "--json"], .imeiShow(json: true))
+        expectParse(["imei", "set", "000000000000141"], .imeiSet("000000000000141", reboot: true, yes: false))
+        expectParse(["imei", "set", "000000000000141", "--no-reboot", "--yes"],
+                    .imeiSet("000000000000141", reboot: false, yes: true))
         expectParse(["radio"], .radio(on: nil))
         expectParse(["radio", "on"], .radio(on: true))
         expectParse(["radio", "off"], .radio(on: false))
@@ -359,6 +518,17 @@ struct ModemCliTests {
         expectParse(["sim", "--json"], .sim(json: true))
         expectParse(["sim", "unlock"], .simUnlock(lastAttempt: false))
         expectParse(["sim", "unlock", "--last-attempt"], .simUnlock(lastAttempt: true))
+        expectParse(["sim", "slot"], .simSlot(json: false))
+        expectParse(["sim", "slot", "--json"], .simSlot(json: true))
+        expectParse(["sim", "slot", "set", "2"], .simSlotSet(2, yes: false))
+        expectParse(["sim", "slot", "set", "1", "--yes"], .simSlotSet(1, yes: true))
+        for words in [["sim", "slot", "set"], ["sim", "slot", "set", "3"], ["sim", "slot", "set", "0"],
+                      ["sim", "slot", "set", "02"], ["sim", "slot", "set", "+1"], ["sim", "slot", "set", "1", "--yes", "--yes"],
+                      ["sim", "slot", "set", "1", "--json"], ["sim", "slot", "2"], ["sim", "slot", "--yes"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
+        check(ModemCommand.simSlotSet(2, yes: true).changesModem, "changesModem: sim slot set")
+        check(!ModemCommand.simSlot(json: false).changesModem, "changesModem: sim slot only reads")
         expectParse(["usbmode"], .usbMode(json: false))
         expectParse(["usbmode", "--json"], .usbMode(json: true))
         expectParse(["usbmode", "set", "qmi"], .usbModeSet(.qmi, reboot: true, yes: false))
@@ -405,10 +575,16 @@ struct ModemCliTests {
         let changing: [ModemCommand] = [.radio(on: true), .radio(on: false), .mode("LTE"), apnSet(apn: "x"),
                                         .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true),
                                         .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true),
-                                        .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa)]
-        let reading: [ModemCommand] = [.network(json: false), .network(json: true), .radio(on: nil), .mode(nil),
+                                        .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa),
+                                        .cellLockCurrent(scsKHz: nil), .cellLockCurrent(scsKHz: 30),
+                                        .cellUnlock(.both), .cellPersist(true),
+                                        .imeiSet("000000000000141", reboot: true, yes: false)]
+        let reading: [ModemCommand] = [.network(json: false), .network(json: true), .antennas(json: false),
+                                       .radio(on: nil), .mode(nil),
                                        .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true),
-                                       .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true)]
+                                       .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true),
+                                       .cellShow(json: false), .imeiShow(json: false),
+                                       .imeiHistory(json: false), .imeiHistory(json: true)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
         // `at` sends what the owner typed, also a change such as AT+CFUN=1,1, and Ctrl-C stops it all the same.
@@ -424,7 +600,7 @@ struct ModemCliTests {
             "band: n41 + n28 (carrier aggregation)",
             "signal: RSRP -95 dBm, RSRQ -10 dB, SINR 8 dB",
             "cell: PCI 32, cell ID 123456789, TAC 1A2B3C",
-            "channel: ARFCN 504990, 100 MHz",
+            "channel: ARFCN 504990, 100 MHz, SCS 30 kHz",
             "connection: idle",
             "radio: on",
             "network mode: automatic (5G, LTE and WCDMA)",
@@ -818,6 +994,7 @@ struct ModemCliTests {
 
         // --- sim ---------------------------------------------------------------------------------
         fake = FakeModem()
+        simSlotVerbs()
         expectLines(run(["sim"], fake, "sim"), ["sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10"],
                     code: 0, "sim: the READY fixture")
         fake = FakeModem()
@@ -1548,5 +1725,322 @@ struct ModemCliTests {
         expectLines(run(["bands", "reset"], fake, "bands reset, read failed"),
                     ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands reset: the read failed")
         check(fake.bandsAsked.isEmpty, "bands reset: the read failed, nothing set")
+
+        // --- antennas, cell & imei ---------------------------------------------------------------
+        fake = FakeModem()
+        expectLines(run(["antennas"], fake, "antennas"), [
+            "prx: RSRP -93 dBm, RSRQ -11 dB, SINR 20 dB",
+            "drx: RSRP -110 dBm, RSRQ -16 dB, SINR 10 dB",
+            "rx2: inactive",
+            "rx3: inactive",
+        ], code: 0, "antennas: prints 4 paths")
+
+        fake = FakeModem()
+        expectLines(run(["cell"], fake, "cell"), [
+            "5g sa lock: unlocked",
+            "lte lock: unlocked",
+            "persist across restart: off (temporary until restart)",
+        ], code: 0, "cell: unlocked")
+
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "current"], fake, "cell lock current"), [
+            "cell: Locked 5G SA cell to band n41, PCI 32, ARFCN 504990, SCS 30 kHz.",
+        ], code: 0, "cell lock current: locks SA leg")
+        check(fake.nrLockSet == [NrCellLock(pci: 32, arfcn: 504990, scsKHz: 30, band: 41)],
+              "cell lock current: passed right NR parameters")
+        check(fake.cellsInUse == [.serving(scsKHz: nil)], "cell lock current: the serving cell, read with the lock")
+        check(!fake.events.contains("networkInfo"), "cell lock current: no separate network read before the lock")
+
+        // A serving 5G SA cell whose subcarrier spacing the modem does not give: refused, never guessed; `--scs` gives it.
+        var noScs = saInfo
+        noScs.serving = parseServingCell(
+            ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-95,-10,8,-,-"])
+        fake = FakeModem()
+        fake.networkResult = .success(noScs)
+        expectLines(run(["cell", "lock", "current"], fake, "cell lock current, no SCS"), [
+            "cell: The modem does not report the subcarrier spacing of its serving 5G SA cell (n41, PCI 32, ARFCN 504990); "
+                + "give it with --scs (15, 30, 60, 120 or 240 kHz). Nothing was changed.",
+        ], code: 1, "cell lock current: no SCS, refused")
+        check(fake.nrLockSet.isEmpty, "cell lock current: no SCS, nothing locked")
+        fake = FakeModem()
+        fake.networkResult = .success(noScs)
+        expectLines(run(["cell", "lock", "current", "--scs", "30"], fake, "cell lock current --scs"), [
+            "cell: Locked 5G SA cell to band n41, PCI 32, ARFCN 504990, SCS 30 kHz.",
+        ], code: 0, "cell lock current --scs: locks with the SCS given")
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "current", "--scs", "15"], fake, "cell lock current --scs differs"), [
+            "cell: The modem reports a subcarrier spacing of 30 kHz for its serving 5G SA cell, not 15 kHz. Nothing was changed.",
+        ], code: 1, "cell lock current --scs: one the modem contradicts is refused")
+        check(fake.nrLockSet.isEmpty, "cell lock current --scs differs: nothing locked")
+
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "sa", "147", "520110", "30", "n41"], fake, "cell lock sa"), [
+            "cell: Locked 5G SA cell to band n41, PCI 147, ARFCN 520110, SCS 30 kHz.",
+        ], code: 0, "cell lock sa")
+
+        fake = FakeModem()
+        fake.cellLockResult = .success(CellLockState(lte: [],
+                                                     nr: NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41),
+                                                     persistLte: false, persistNr: false))
+        expectLines(run(["cell", "unlock"], fake, "cell unlock"), [
+            "cell: Unlocked 5G SA cell lock.",
+        ], code: 0, "cell unlock: unlocks active lock")
+
+        fake = FakeModem()
+        expectLines(run(["imei"], fake, "imei"), ["imei: 000000000000091"], code: 0, "imei")
+
+        fake = FakeModem()
+        let badImeiRun = run(["imei", "set", "000000000000142"], fake, "imei bad luhn")
+        expectLines(badImeiRun, [
+            "imei: The IMEI check digit is not valid (expected 1 as the 15th digit). Nothing was changed.",
+        ], code: 1, "imei set: rejects invalid Luhn without opening modem")
+        check(fake.events.filter { $0 != "output" }.isEmpty, "imei set: bad Luhn touched nothing")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000091"], fake, "imei unchanged"), [
+            "imei: already 000000000000091; nothing changed",
+        ], code: 0, "imei set: unchanged")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141"], fake, answer: nil, "imei no tty"), [
+            "imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking",
+        ], code: 2, "imei set: refuses restart without terminal")
+        check(!fake.events.contains("setImei"), "imei set: nothing written without an answer")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei --yes"), [
+            "imei: IMEI set to 000000000000141; the modem is restarting.",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 0, "imei set --yes")
+        equal(fake.imeiExpectAsked, [ImeiExpectation(module: "c0ffee01", before: "000000000000091")],
+              "imei set: written only on the module and over the IMEI read first")
+
+        // --no-reboot asks too (the write is a change), naming the module and both IMEIs.
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--no-reboot"], fake, answer: nil, "imei no-reboot no tty"), [
+            "imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking",
+        ], code: 2, "imei set --no-reboot: asks, and without a terminal changes nothing")
+        check(!fake.events.contains("setImei"), "imei set --no-reboot: nothing written unasked")
+        fake = FakeModem()
+        let asked = run(["imei", "set", "000000000000141", "--no-reboot"], fake, answer: "y", "imei no-reboot asked")
+        equal(asked.code, 0, "imei set --no-reboot: answered yes, written")
+        equal(asked.questions, ["The IMEI of module c0ffee01 will change from 000000000000091 to 000000000000141. "
+                                + "It takes effect at the next restart. Continue? [y/N] "], "imei set --no-reboot: the question")
+        equal(fake.imeiSetAsked.last?.reboot, false, "imei set --no-reboot: not restarted")
+
+        // Another module on the port that writes (swapped after the question): nothing written, said, exit 1.
+        fake = FakeModem()
+        fake.sessionModule = "0badbeef"
+        let swapped = run(["imei", "set", "000000000000141", "--yes"], fake, "imei swapped")
+        check(swapped.code == 1 && swapped.lines.last?.hasPrefix("imei: The modem attached is not the module") == true,
+              "imei set: another module when writing, nothing written", "\(swapped.lines)")
+        // The IMEI changed meanwhile (another tool): nothing written, said.
+        fake = FakeModem()
+        fake.sessionBefore = "000000000000117"
+        let moved = run(["imei", "set", "000000000000141", "--yes"], fake, "imei moved")
+        check(moved.code == 1 && moved.lines.last?.contains("now, not 000000000000091") == true,
+              "imei set: another IMEI when writing, nothing written", "\(moved.lines)")
+        // A module that gives no serial number: not changed, not even asked.
+        fake = FakeModem()
+        fake.readingModule = nil
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei no module"), [
+            "imei: The modem gives no USB serial number, so the change cannot be tied to this module. Nothing was changed.",
+        ], code: 1, "imei set: no module, nothing changed")
+        check(!fake.events.contains("setImei"), "imei set: no module, nothing written")
+
+        // Written and read back, the restart refused: said, the way back, exit 1.
+        fake = FakeModem()
+        let sentence = "The IMEI is now 000000000000141, but the modem was not restarted. The modem refused the command "
+            + "(ERROR). It takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+        fake.setImeiResult = .success(.restartFailed(before: "000000000000091", after: "000000000000141", sentence: sentence))
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei restart failed"), [
+            "imei: \(sentence)",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 1, "imei set: written, the restart failed")
+
+        imeiHistoryVerbs()
+    }
+
+    /// `imei set` records each change it sends in the IMEI history (with the IMEI before and the module as the change's
+    /// own port open read them, not the registry's module or an earlier read; `cli`; the result), and nothing when it
+    /// sends none; `imei history` prints the history, also as JSON, and never asks the modem anything.
+    static func imeiHistoryVerbs() {
+        let when = Date(timeIntervalSince1970: 1_795_000_000)
+        let keeper = MemoryHistory()
+        let recorder = ImeiHistoryRecorder(keeper: keeper, module: { "f00dcafe" }, now: { when })
+
+        var fake = FakeModem()
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: set")
+        equal(keeper.entries.count, 1, "history: one entry after a change")
+        equal(keeper.entries.first, ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
+                                                     source: .cli, result: .succeeded, restart: true,
+                                                     restartResult: .succeeded, module: "c0ffee01",
+                                                     message: "IMEI set to 000000000000141; the modem is restarting.",
+                                                     note: nil), "history: the entry")
+
+        // The IMEI before and the module as the change's port read them (another tool changed the IMEI after the verb's
+        // first read): nothing written, recorded as failed with what that port read.
+        fake = FakeModem()
+        fake.sessionBefore = "000000000000117"
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: the session's")
+        equal(keeper.entries.last?.before, "000000000000117", "history: the IMEI before from the change's port")
+        equal(keeper.entries.last?.module, "c0ffee01", "history: the module from the change's port")
+        equal(keeper.entries.last?.result, .failed, "history: not written over another IMEI")
+        keeper.entries.removeLast()
+        // Written, the restart refused: recorded as written, its restart failed.
+        fake = FakeModem()
+        fake.setImeiResult = .success(.restartFailed(before: "000000000000091", after: "000000000000141",
+                                                     sentence: "Made-up sentence."))
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: restart failed")
+        check(keeper.entries.last?.result == .succeeded && keeper.entries.last?.restartResult == .failed,
+              "history: written, its restart failed, recorded apart")
+        keeper.entries.removeLast()
+
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000091"], fake, history: recorder, "history: unchanged")
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000141"], fake, answer: "n", history: recorder, "history: cancelled")
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000142", "--yes"], fake, history: recorder, "history: bad check digit")
+        equal(keeper.entries.count, 1, "history: nothing recorded when nothing was sent")
+
+        fake = FakeModem()
+        fake.setImeiResult = .failure(ModemFailure(message: "The IMEI was not changed. ERROR"))
+        let failed = run(["imei", "set", "000000000000141", "--no-reboot", "--yes"], fake, history: recorder, "history: failed")
+        equal(failed.code, 1, "history: a failure still exits 1")
+        equal(keeper.entries.last?.result, .failed, "history: a failure recorded as failed")
+        equal(keeper.entries.last?.restart, false, "history: --no-reboot recorded")
+        equal(keeper.entries.last?.message, "The IMEI was not changed. ERROR", "history: the failure's sentence")
+
+        // A history that cannot be written adds a line; the change's own result and exit code stand.
+        keeper.refuse = "The IMEI history could not be written (/x)."
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: not written"), [
+            "imei: the change was not recorded in the IMEI history. The IMEI history could not be written (/x).",
+            "imei: IMEI set to 000000000000141; the modem is restarting.",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 0, "history: not written")
+        keeper.refuse = nil
+
+        fake = FakeModem()
+        let shown = run(["imei", "history"], fake, history: recorder, "history: show")
+        equal(shown.code, 0, "history: show exits 0")
+        equal(shown.lines.first, "imei: 2 IMEI changes recorded on this Mac, newest first", "history: headline")
+        equal(shown.lines.last, "imei: kept in /memory/imei-history.jsonl", "history: location")
+        check(fake.events.allSatisfy { $0 == "output" }, "history: the modem is not asked", "\(fake.events)")
+
+        fake = FakeModem()
+        let json = run(["imei", "history", "--json"], fake, history: recorder, "history: json")
+        equal(json.code, 0, "history json: exits 0")
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.lines.joined(separator: "\n").utf8))) as? [String: Any]
+        equal((object?["entries"] as? [Any])?.count, 2, "history json: entries")
+        equal(object?["path"] as? String, "/memory/imei-history.jsonl", "history json: path")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "history"], fake, "history: none kept"), ["imei: No IMEI history is kept here."], code: 1,
+                    "history: no recorder")
+        keeper.loadFailure = "The IMEI history could not be read (/x)."
+        fake = FakeModem()
+        expectLines(run(["imei", "history"], fake, history: recorder, "history: unreadable"),
+                    ["imei: The IMEI history could not be read (/x)."], code: 1, "history: unreadable")
+    }
+}
+
+/// `sim slot` and `sim slot set`, and the slot in `sim` and `sim --json` (a field added, none changed).
+func simSlotVerbs() {
+    var fake = FakeModem()
+    var withSlot = readySim
+    withSlot.activeSlot = 2
+    fake.simResult = .success(withSlot)
+    expectLines(run(["sim"], fake, "sim with slot"),
+                ["sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10", "sim: slot: 2"], code: 0,
+                "sim: the slot as its last line")
+    let json = simJSON(withSlot)
+    check(json["activeSlot"] as? Int == 2 && json["state"] as? String == "ready" && json["pinLock"] as? Bool == false
+            && json["pinAttempts"] as? Int == 3 && json["pukAttempts"] as? Int == 10,
+          "sim --json: activeSlot added, the other keys kept", "\(json)")
+    check(simJSON(readySim)["activeSlot"] is NSNull, "sim --json: activeSlot null when not read")
+
+    fake = FakeModem()
+    fake.simSlotResult = .success(2)
+    expectLines(run(["sim", "slot"], fake, "sim slot"), ["sim: slot 2"], code: 0, "sim slot")
+    let shown = run(["sim", "slot", "--json"], fake, "sim slot --json")
+    let object = (try? JSONSerialization.jsonObject(with: Data(shown.lines.joined(separator: "\n").utf8))) as? [String: Any]
+    check(shown.code == 0 && object?["activeSlot"] as? Int == 2, "sim slot --json", "\(shown.lines)")
+    fake.simSlotResult = .failure(ModemFailure(message: "The modem does not switch SIM slots. ERROR"))
+    expectLines(run(["sim", "slot"], fake, "sim slot refused"), ["sim: The modem does not switch SIM slots. ERROR"],
+                code: 1, "sim slot: refused")
+
+    // Already there: nothing asked or sent.
+    fake = FakeModem()
+    expectLines(run(["sim", "slot", "set", "1"], fake, "slot already"), ["sim: already on SIM 1; nothing changed"],
+                code: 0, "sim slot set: already")
+    check(fake.simSlotsAsked.isEmpty && !fake.events.contains("ask"), "sim slot set: already, nothing sent or asked")
+
+    // No terminal, or a no: nothing changed.
+    fake = FakeModem()
+    let noTerminal = run(["sim", "slot", "set", "2"], fake, answer: nil, "slot no terminal")
+    expectLines(noTerminal, ["sim: no terminal to ask on, so nothing changed; run again with --yes to switch without asking"],
+                code: 2, "sim slot set: no terminal")
+    check(fake.simSlotsAsked.isEmpty, "sim slot set: no terminal, nothing sent")
+    fake = FakeModem()
+    expectLines(run(["sim", "slot", "set", "2"], fake, answer: "n", "slot cancelled"), ["cancelled; nothing changed"],
+                code: 1, "sim slot set: cancelled")
+    check(fake.simSlotsAsked.isEmpty, "sim slot set: cancelled, nothing sent")
+
+    // Asked, then switched: the question says the connection drops; the result waits for the registration.
+    fake = FakeModem()
+    let asked = run(["sim", "slot", "set", "2"], fake, answer: "y", "slot asked")
+    check(asked.questions.count == 1 && asked.questions[0].contains("The connection drops")
+            && asked.questions[0].hasSuffix("Switch to SIM 2? [y/N] "), "sim slot set: the question", "\(asked.questions)")
+    expectLines(asked, ["sim: Switched to SIM 2. SIM ready; registered, home network (5GS) after 5 s.",
+                        "sim: to switch back: RMNet sim slot set 1"], code: 0, "sim slot set: switched")
+    check(fake.simSlotsAsked.count == 1 && fake.simSlotsAsked[0].slot == 2 && fake.simSlotsAsked[0].wait == .registration,
+          "sim slot set: waits for the registration")
+
+    // --yes; a new slot with no SIM is still a switch made.
+    fake = FakeModem()
+    fake.setSimSlotResult = .success(SimSlotChange(before: 1, after: 2, sim: .notInserted))
+    expectLines(run(["sim", "slot", "set", "2", "--yes"], fake, "slot empty"),
+                ["sim: Switched to SIM 2, but it has no usable SIM (not inserted).", "sim: to switch back: RMNet sim slot set 1"],
+                code: 0, "sim slot set: an empty slot")
+    check(!fake.events.contains("ask"), "sim slot set --yes: not asked")
+
+    fake = FakeModem()
+    fake.setSimSlotResult = .failure(ModemFailure(message: "The SIM slot was not changed. ERROR"))
+    expectLines(run(["sim", "slot", "set", "2", "--yes"], fake, "slot refused"),
+                ["sim: The SIM slot was not changed. ERROR"], code: 1, "sim slot set: refused")
+
+    // The sentences.
+    check(simSlotSentence(SimSlotChange(before: 2, after: 2)) == "Already on SIM 2; nothing changed.", "sentence: same")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 2))
+            == "Switched to SIM 2. SIM ready.", "sentence: ready, no registration waited for")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, registration: Registration(status: .searching, domain: "5GS")))
+            == "Switched to SIM 2. SIM ready; searching (not registered yet).", "sentence: not registered yet",
+          simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, registration: Registration(status: .searching, domain: "5GS"))))
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .pin)) == "Switched to SIM 2. SIM: asks for its PIN.",
+          "sentence: PIN")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .failure))
+            == "Switched to SIM 2, but it has no usable SIM (SIM failure).", "sentence: failure")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2)) == "Switched to SIM 2; its SIM state could not be read.",
+          "sentence: not read")
+}
+
+/// An IMEI history in memory.
+final class MemoryHistory: ImeiHistoryKeeping {
+    var entries: [ImeiHistoryEntry] = []
+    var refuse: String? = nil
+    var loadFailure: String? = nil
+    var location: String { "/memory/imei-history.jsonl" }
+
+    func load() -> Result<ImeiHistory, ModemFailure> {
+        if let loadFailure { return .failure(ModemFailure(message: loadFailure)) }
+        return .success(ImeiHistory(entries: entries, skippedLines: 0))
+    }
+
+    func append(_ entry: ImeiHistoryEntry) -> String? {
+        if let refuse { return refuse }
+        entries.append(entry)
+        return nil
     }
 }

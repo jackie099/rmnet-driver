@@ -1,6 +1,7 @@
-// The window's visual language, shared by every screen: cards, the status pill, the technology badge, the signal
-// bars, the metric gauge, key and value rows, the result banner (and the slot at the bottom of a screen it shows
-// in), the quit notice, empty states, and the spacing scale. The charts are in Charts.swift. The values drawn come
+// The window's visual language, shared by every screen: cards (and the headings of their parts), the status pill,
+// the state badge, the technology badge, the signal bars, the metric gauge, key and value rows, the result banner
+// (and the slot at the bottom of a screen it shows in), the quit notice, empty states, the sheets' header, the warning
+// and problem lines, and the spacing scale. The charts are in Charts.swift. The values drawn come
 // from the pure models (SignalQuality.swift, ShellModel.swift); nothing here reads anything.
 import AppKit
 import SwiftUI
@@ -130,7 +131,34 @@ struct CardBackground: View {
     }
 }
 
-// MARK: - Status pill, technology badge, signal bars
+/// The heading of one part of a card ("Carriers", "Antennas", "Neighbour cells"), with an optional note at the
+/// trailing edge ("Primary first"): every part of every card is headed the same way.
+struct CardSectionHeading: View {
+    let title: String
+    var note: String? = nil
+
+    init(_ title: String, note: String? = nil) {
+        self.title = title
+        self.note = note
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+            Text(verbatim: title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: Spacing.s)
+            if let note {
+                Text(verbatim: note)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+// MARK: - Status pill, state badge, technology badge, signal bars
 
 /// A dot and words in a capsule: the connection's state (ConnectionState.tint), pulsing while connecting.
 /// `prominent`: the Overview's version, the words in `.largeTitle` weight and no capsule.
@@ -157,6 +185,33 @@ struct StatusPill: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(verbatim: "Status: \(text)"))
+    }
+}
+
+/// A state that is not the connection's (a lock, a result) as a symbol and words in a tinted capsule: "Locked" orange
+/// with a closed lock, "Not locked" gray with an open one, "Succeeded" green. Not the status pill, whose dot and
+/// colours mean the connection's state.
+struct StateBadge: View {
+    let text: String
+    let symbol: String
+    var tint: Color = .secondary
+
+    var body: some View {
+        Label {
+            Text(verbatim: text)
+        } icon: {
+            Image(systemName: symbol)
+                .imageScale(.small)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(tint.opacity(0.12)))
+        .lineLimit(1)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: text))
     }
 }
 
@@ -350,31 +405,44 @@ struct KeyValueRow: View {
     }
 }
 
-/// A result line as a banner: a green check after a change that succeeded, a red exclamation after one that did
-/// not, a spinner while one runs; the controller's words unchanged (selectable), and a dismiss button.
+/// A result line as a banner: a spinner while its request runs, a green check after a change that succeeded, an orange
+/// triangle after one that succeeded with something to read, a red exclamation after one that did not; the
+/// controller's words unchanged (selectable), and a dismiss button.
 struct Banner: View {
     let text: String
-    let isFailure: Bool
-    var inProgress = false
+    let kind: ResultKind
     let onDismiss: () -> Void
 
-    init(text: String, isFailure: Bool, inProgress: Bool = false, onDismiss: @escaping () -> Void) {
+    init(text: String, kind: ResultKind, onDismiss: @escaping () -> Void) {
         self.text = text
-        self.isFailure = isFailure
-        self.inProgress = inProgress
+        self.kind = kind
         self.onDismiss = onDismiss
     }
 
     var body: some View {
-        let tint: Color = inProgress ? .accentColor : isFailure ? .red : .green
+        let tint: Color = switch kind {
+        case .progress: .accentColor
+        case .success: .green
+        case .warning: .orange
+        case .failure: .red
+        }
         HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
             Group {
-                if inProgress {
+                switch kind {
+                case .progress:
                     ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: isFailure ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                case .success:
+                    Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(tint)
-                        .accessibilityLabel(Text(isFailure ? "Failed" : "Done"))
+                        .accessibilityLabel(Text("Done"))
+                case .warning:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(tint)
+                        .accessibilityLabel(Text("Warning"))
+                case .failure:
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(tint)
+                        .accessibilityLabel(Text("Failed"))
                 }
             }
             .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
@@ -404,32 +472,35 @@ struct Banner: View {
 }
 
 extension View {
-    /// The screen's banner slot: its result line (`text`; "" for none) as a Banner at the bottom of the screen,
-    /// over its content's inset. Dismissed, it stays away until the text changes. Attach it to the screen's root.
-    func resultBanner(_ text: String, isFailure: Bool, inProgress: Bool = false) -> some View {
-        modifier(ResultBannerSlot(text: text, isFailure: isFailure, inProgress: inProgress))
+    /// The screen's banner slot: its controller's result line (`text`; "" for none) as a Banner at the bottom of the
+    /// screen, over its content's inset. Its X calls `dismiss`, which clears the line in the controller (so it stays
+    /// away on every screen and in a new window); `hover` tells the controller where the pointer is, so that a success
+    /// does not go by itself while it is being read (ResultLine.swift). Attach it to the screen's root.
+    func resultBanner(_ text: String, kind: ResultKind, dismiss: @escaping () -> Void,
+                      hover: @escaping (Bool) -> Void) -> some View {
+        modifier(ResultBannerSlot(text: text, kind: kind, dismiss: dismiss, hover: hover))
     }
 }
 
 private struct ResultBannerSlot: ViewModifier {
     let text: String
-    let isFailure: Bool
-    let inProgress: Bool
-    @State private var dismissed = false
+    let kind: ResultKind
+    let dismiss: () -> Void
+    let hover: (Bool) -> Void
 
     func body(content: Content) -> some View {
         content
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !text.isEmpty && !dismissed {
-                    Banner(text: text, isFailure: isFailure, inProgress: inProgress) { dismissed = true }
+                if !text.isEmpty {
+                    Banner(text: text, kind: kind, onDismiss: dismiss)
+                        .onHover(perform: hover)
+                        .onDisappear { hover(false) }
                         .padding(.horizontal, Spacing.l)
                         .padding(.bottom, Spacing.m)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .animation(.snappy, value: text)
-            .animation(.snappy, value: dismissed)
-            .onChange(of: text) { _, _ in dismissed = false }
     }
 }
 
@@ -501,5 +572,71 @@ struct ChartPlaceholder: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
             .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.quaternary.opacity(0.5)))
+    }
+}
+
+// MARK: - Sheets
+
+/// A sheet's header: its symbol (secondary, or orange for a sheet that asks for care), its title in `.title3` and a
+/// line under it. Every sheet of the window starts with one.
+struct SheetHeader: View {
+    let symbol: String
+    let title: String
+    var subtitle: String? = nil
+    var tint: Color = .secondary
+
+    var body: some View {
+        HStack(alignment: .center, spacing: Spacing.m) {
+            Image(systemName: symbol)
+                .font(.title2)
+                .foregroundStyle(tint)
+                .frame(width: 28)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: title)
+                    .font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+                if let subtitle {
+                    Text(verbatim: subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}
+
+/// A caution (what a change does to the connection, above a sheet's buttons; what not to do, under a screen's
+/// buttons): an orange triangle and the words in secondary.
+struct WarningNote: View {
+    let text: String
+
+    var body: some View {
+        Label {
+            Text(verbatim: text)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// A rule that what is typed breaks, or a request that failed: a red exclamation and the words.
+struct ProblemNote: View {
+    let text: String
+
+    var body: some View {
+        Label {
+            Text(verbatim: text)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.circle.fill")
+        }
+        .font(.callout)
+        .foregroundStyle(.red)
     }
 }

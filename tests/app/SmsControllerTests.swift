@@ -23,6 +23,9 @@ enum Call: Equatable {
     case list
     case delete([Int])
     case send(String, String)
+    case resend([Int])
+    case unblockSlice(start: Bool, finish: Bool)
+    case healCnmi
 }
 
 /// Records each call, then blocks it (on the controller's queue) until the test releases it with a result.
@@ -32,7 +35,9 @@ final class FakeService: SmsServing {
     private var log: [Call] = []
     private var listResults: [Result<SmsListing, SmsFailure>] = []
     private var deleteResults: [Result<Int, SmsFailure>] = []
-    private var sendResults: [Result<Int, SmsFailure>] = []
+    private var sendResults: [Result<SmsSent, SmsFailure>] = []
+    private var unblockResults: [Result<SmsUnblockSlice, SmsFailure>] = []
+    private var countResults: [Result<SmsStoreCount, SmsFailure>] = []
     private var inside = 0   // calls entered and not yet returned
     private var mostInside = 0
 
@@ -66,14 +71,49 @@ final class FakeService: SmsServing {
         return locked { deleteResults.removeFirst() }
     }
 
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> {
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
         enter(.send(number, text))
         return locked { sendResults.removeFirst() }
     }
 
+    // The window's delete and Retry (checked against the modem by the real service): the indices of the parts.
+    func delete(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<Int, SmsFailure> {
+        enter(.delete(parts.map { $0.index }))
+        return locked { deleteResults.removeFirst() }
+    }
+
+    func resend(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<SmsSent, SmsFailure> {
+        enter(.resend(parts.map { $0.index }))
+        return locked { sendResults.removeFirst() }
+    }
+
+    func unblockSlice(start: Bool, finish: Bool) -> Result<SmsUnblockSlice, SmsFailure> {
+        enter(.unblockSlice(start: start, finish: finish))
+        return locked { unblockResults.removeFirst() }
+    }
+
+    func healCnmi() -> Result<SmsUnblockSlice, SmsFailure> {
+        enter(.healCnmi)
+        return locked { unblockResults.removeFirst() }
+    }
+
+    func countUnread() -> Result<SmsStoreCount, SmsFailure> {
+        locked { countResults.removeFirst() }
+    }
+
     func releaseList(_ result: Result<SmsListing, SmsFailure>) { locked { listResults.append(result) }; gate.signal() }
     func releaseDelete(_ result: Result<Int, SmsFailure>) { locked { deleteResults.append(result) }; gate.signal() }
-    func releaseSend(_ result: Result<Int, SmsFailure>) { locked { sendResults.append(result) }; gate.signal() }
+    /// The parts sent (stored at no index known to the test), or the failure.
+    func releaseSend(_ result: Result<Int, SmsFailure>) {
+        locked { sendResults.append(result.map { SmsSent(parts: $0) }) }
+        gate.signal()
+    }
+    func releaseSent(_ result: Result<SmsSent, SmsFailure>) { locked { sendResults.append(result) }; gate.signal() }
+    func releaseUnblock(_ result: Result<SmsUnblockSlice, SmsFailure>) {
+        locked { unblockResults.append(result) }
+        gate.signal()
+    }
+    func queueCount(_ result: Result<SmsStoreCount, SmsFailure>) { locked { countResults.append(result) } }
 }
 
 // MARK: - Helpers
@@ -130,8 +170,10 @@ func message(_ indices: [Int], sender: String = "+27838890001", text: String = "
                text: text, missingParts: 0, readable: true)
 }
 
+/// A listing of `messages`, each stored part listed too (as the service lists them: a delete takes them from there).
 func listing(_ messages: [SmsMessage], used: Int? = nil, total: Int? = nil) -> Result<SmsListing, SmsFailure> {
-    .success(SmsListing(messages: messages, used: used, total: total))
+    let parts = messages.flatMap { m in m.indices.map { StoredPdu(index: $0, status: .read, hex: String(format: "00%04X", $0)) } }
+    return .success(SmsListing(messages: messages, used: used, total: total, parts: parts))
 }
 
 let notKnown = SmsFailure(message: "The message failed. The modem did not answer in time. It is not known whether it was "
@@ -140,6 +182,28 @@ let refused = SmsFailure(message: "The message was refused. The modem refused th
 let listFailed = SmsFailure(message: "Another program is using the modem's spare AT port.")
 let deleteFailed = SmsFailure(message: "Stored part 3 could not be deleted. The modem refused the command (ERROR). "
                               + "0 of 2 stored part(s) were deleted before it.")
+
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
+/// Timers that run when the test moves the time on (the result banner's).
+final class FakeClock {
+    private(set) var now: TimeInterval = 0
+    private var timers: [(due: TimeInterval, body: () -> Void)] = []
+
+    func after(_ delay: TimeInterval, _ body: @escaping () -> Void) { timers.append((now + delay, body)) }
+
+    func advance(_ seconds: TimeInterval) {
+        let end = now + seconds
+        while let next = timers.enumerated().filter({ $0.element.due <= end }).min(by: { $0.element.due < $1.element.due }) {
+            timers.remove(at: next.offset)
+            now = next.element.due
+            next.element.body()
+        }
+        now = end
+    }
+}
 
 // MARK: - The checks
 
@@ -152,6 +216,8 @@ struct SmsControllerTests {
         quitting()
         resuming()
         composingAndStore()
+        banner()
+        unblocking()
         print("smsui-test: \(checks) checks passed")
     }
 
@@ -163,7 +229,7 @@ struct SmsControllerTests {
         check(c.sendEnabled, "send: enabled with a number and a text")
         rig.startSend()
         check(c.running == .sending, "send: running is .sending")
-        check(!c.sendEnabled && !c.refreshEnabled && !c.deleteEnabled, "send: nothing else is enabled while it runs")
+        check(!c.sendEnabled && !c.refreshEnabled && !c.changeEnabled, "send: nothing else is enabled while it runs")
         c.send()
         c.tick()
         c.refresh()
@@ -286,7 +352,7 @@ struct SmsControllerTests {
         check(c.result == "Deleting 3 stored part(s)…", "delete: the running sentence", c.result)
         rig.fake.releaseDelete(.success(3))
         pump(until: { c.running == nil }, "the delete comes back")
-        check(c.result == "Deleted 3 stored part(s)." && c.selection == nil, "delete: the success sentence", c.result)
+        check(c.result == "Deleted 3 stored part(s).", "delete: the success sentence", c.result)
 
         let gone = message([9], sender: "+27830000000")
         let before = rig.fake.calls
@@ -473,5 +539,166 @@ struct SmsControllerTests {
               "store: the warning reaches the list line", c.listText)
         rig.list(listing([message([1])], used: nil, total: nil))
         check(!c.listText.contains("stored parts"), "store: unknown use is not shown", c.listText)
+    }
+
+    // The result banner: dismissed, the line is cleared in the controller, so showing another screen and this one
+    // again (or a new window, which reads the same controller) does not bring it back; a success goes after 8 s; a
+    // failure stays; a new result replaces the old one.
+    static func banner() {
+        let fake = FakeService()
+        let clock = FakeClock()
+        let c = SmsController(service: fake, replyToQuit: { _ in }, requestAttention: {}, resultTimer: clock.after)
+        func send(_ outcome: Result<Int, SmsFailure>) {
+            c.to = "+12025550100"
+            c.text = "Made-up text"
+            c.send()
+            pump(until: { fake.blocked == 1 }, "banner: the send reaches the service")
+            check(c.resultKind == .progress, "banner: the send's words while it runs", "\(c.resultKind)")
+            clock.advance(30)
+            check(!c.result.isEmpty, "banner: a request's words do not go by themselves")
+            fake.releaseSend(outcome)
+            pump(until: { c.running == nil }, "banner: the send comes back")
+        }
+
+        // Dismissed: cleared, and another screen and back (with its listing) does not bring it back.
+        send(.success(1))
+        equal(c.result, "Sent to +12025550100 in 1 part(s).", "banner: the success")
+        check(c.resultKind == .success, "banner: a success")
+        c.dismissResult()
+        equal(c.result, "", "banner: dismissed, the line is cleared")
+        c.setTabShown(false)
+        c.setTabShown(true)
+        pump(until: { fake.blocked == 1 }, "banner: the screen lists again")
+        fake.releaseList(listing([]))
+        pump(until: { c.running == nil }, "banner: the listing comes back")
+        c.setTabShown(false)
+        equal(c.result, "", "banner: dismissed, it does not come back on another screen and back")
+
+        // A success goes after 8 s, not before.
+        send(.success(1))
+        clock.advance(7.5)
+        equal(c.result, "Sent to +12025550100 in 1 part(s).", "banner: a success still there at 7.5 s")
+        clock.advance(0.5)
+        equal(c.result, "", "banner: a success gone at 8 s")
+        // Not while the pointer is on it.
+        send(.success(1))
+        c.hoverResult(true)
+        clock.advance(20)
+        check(!c.result.isEmpty, "banner: under the pointer, it stays")
+        c.hoverResult(false)
+        clock.advance(ResultExpiry.afterHover)
+        equal(c.result, "", "banner: gone after the pointer left")
+
+        // A failure stays until dismissed or replaced.
+        send(.failure(refused))
+        clock.advance(3600)
+        equal(c.result, refused.message, "banner: a failure stays")
+        check(c.resultKind == .failure && c.resultIsFailure, "banner: a failure")
+        // A new result replaces it (and a success's time starts with it).
+        send(.success(2))
+        equal(c.result, "Sent to +12025550100 in 2 part(s).", "banner: the next result replaces the failure")
+        clock.advance(8)
+        equal(c.result, "", "banner: and goes as a success")
+
+        // A success with something to read (not stored on the modem) is a warning: it stays.
+        c.to = "+12025550100"
+        c.text = "Made-up text"
+        c.send()
+        pump(until: { fake.blocked == 1 }, "banner: a send")
+        fake.releaseSent(.success(SmsSent(parts: 1, indices: [], stored: false)))
+        pump(until: { c.running == nil }, "banner: it comes back")
+        check(c.resultKind == .warning, "banner: not stored, a warning", "\(c.resultKind)")
+        clock.advance(60)
+        check(c.result.hasPrefix("Sent to +12025550100 in 1 part(s). It is not stored"), "banner: a warning stays", c.result)
+    }
+
+    // Manual Unblock, automatic unblocking when +CMTI without storage is seen, notice when the setting is off,
+    // healing AT+CNMI=2,2 on pulse, and quitting between or during slices.
+    static func unblocking() {
+        let mmsHex = "07912120550501F04404C9320000046211220292942B2C0605040B8423F0010601BE8C82987478008D9089178031323032353535303134342F545950453D504C4D4E00"
+        let smsHex = "07912120550501F0040B912120550561F400006211220293002B05C8329BFD06"
+        let mmsPart = StoredPdu(index: 10, status: .unread, hex: mmsHex)
+        let smsPart = StoredPdu(index: 11, status: .unread, hex: smsHex)
+
+        let fake = FakeService()
+        var autoOn = false
+        var notifyOn = true
+        let clock = Date(timeIntervalSince1970: 1_800_000_000)
+        var alerts: [MessageAlert] = []
+        var replies: [Bool] = []
+        let c = SmsController(service: fake,
+                              replyToQuit: { replies.append($0) },
+                              requestAttention: {},
+                              notifyEnabled: { notifyOn },
+                              autoUnblockEnabled: { autoOn },
+                              unblockWindow: 10,
+                              slicePause: 0.01,
+                              now: { clock },
+                              alert: { alerts.append($0) })
+
+        // Setting off: blockedSmsSeen marks incomingBlocked without calling the service; turning it on starts unblocking.
+        c.blockedSmsSeen()
+        check(c.incomingBlocked && fake.calls.isEmpty, "unblock: setting off shows notice without opening port")
+        autoOn = true
+        c.autoUnblockSettingChanged(true)
+        pump(until: { fake.calls == [.unblockSlice(start: true, finish: false)] && fake.blocked == 1 },
+             "unblock: turning setting on starts slice 1")
+        check(!c.incomingBlocked && c.running == .unblocking, "unblock: incomingBlocked cleared while running")
+        // Slice 1 receives MMS + SMS; slice 2 is quiet -> finalization slice restores 2,1 and counts unread in the background.
+        fake.queueCount(.success(SmsStoreCount(used: 2, received: 2, unread: 2)))
+        fake.releaseUnblock(.success(SmsUnblockSlice(parts: [mmsPart, smsPart])))
+        pump(until: { fake.calls.count == 2 && fake.blocked == 1 }, "unblock: follow-up slice 2 starts")
+        fake.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake.calls.count == 3 && fake.blocked == 1 }, "unblock: finalization slice restores CNMI=2,1")
+        fake.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { c.running == nil && alerts.count == 1 }, "unblock: finishes and posts alert")
+        check(c.result == "Unblocked incoming messages: stored 2 part(s) (1 MMS notification)." && !c.resultIsFailure,
+              "unblock: result banner sentence", c.result)
+        check(alerts == [.summary(unread: 2)], "unblock: unread count updated after automatic unblock", "\(alerts)")
+
+        // Pulse commands include AT+CNMI? when autoUnblock is on, or once on attach when off; CNMI=2,2 heals even when off.
+        notifyOn = false
+        check(c.pulseCommands(turn: 1) == ["AT+CNMI?"], "unblock: pulse reads AT+CNMI? with autoUnblock on")
+        autoOn = false
+        check(c.pulseCommands(turn: 1) == [], "unblock: pulse reads nothing with both off")
+        c.modemPresent(true)
+        check(c.pulseCommands(turn: 1) == ["AT+CNMI?"], "unblock: modem attach checks AT+CNMI? once")
+        c.pulseAnswers(.success(["AT+CNMI?": .lines(["+CNMI: 2,2,0,0,0"])]))
+        pump(until: { fake.calls.last == .healCnmi && fake.blocked == 1 }, "unblock: crashed CNMI=2,2 triggers healCnmi")
+        fake.releaseUnblock(.success(SmsUnblockSlice(restoredCnmi: true)))
+        pump(until: { c.running == nil }, "unblock: healCnmi finishes")
+        check(c.result == "Restored incoming message storage (AT+CNMI=2,1,0,0,0); no queued messages arrived.",
+              "unblock: healed CNMI reported", c.result)
+
+        // Quitting between two slices runs one finalization pass to restore AT+CNMI=2,1,0,0,0 before quitting.
+        let fake2 = FakeService()
+        var replies2: [Bool] = []
+        let c2 = SmsController(service: fake2, replyToQuit: { replies2.append($0) }, requestAttention: {},
+                               unblockWindow: 60, slicePause: 5.0, now: { clock })
+        c2.unblock()
+        pump(until: { fake2.blocked == 1 }, "unblock quit: slice 1 starts")
+        fake2.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake2.blocked == 0 && c2.running == .unblocking }, "unblock quit: waiting between slices")
+        check(c2.quitWhenFinished() == true, "unblock quit: between slices restores CNMI=2,1 before quitting")
+        pump(until: { fake2.calls.last == .unblockSlice(start: false, finish: true) && fake2.blocked == 1 },
+             "unblock quit: finalization slice starts")
+        fake2.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { replies2 == [true] && c2.running == nil }, "unblock quit: replies true after CNMI=2,1 restored")
+
+        // Quitting during an in-flight slice finishes that slice, restores CNMI=2,1, and quits.
+        let fake3 = FakeService()
+        var replies3: [Bool] = []
+        let c3 = SmsController(service: fake3, replyToQuit: { replies3.append($0) }, requestAttention: {},
+                               unblockWindow: 60, slicePause: 0.01, now: { clock })
+        c3.unblock()
+        pump(until: { fake3.blocked == 1 }, "unblock quit in-flight: slice 1 starts")
+        check(c3.quitWhenFinished() == true, "unblock quit in-flight: waits for active slice")
+        fake3.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake3.calls.last == .unblockSlice(start: false, finish: true) && fake3.blocked == 1 },
+             "unblock quit in-flight: finalization slice restores CNMI=2,1")
+        fake3.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { replies3 == [true] }, "unblock quit in-flight: replies true after CNMI=2,1 restored")
+        check(fake3.calls == [.unblockSlice(start: true, finish: false), .unblockSlice(start: false, finish: true)],
+              "unblock quit in-flight: no listening slice started after quit")
     }
 }

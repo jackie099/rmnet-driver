@@ -16,8 +16,11 @@
 // from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
 import Foundation
 
+enum CellUnlockScope: Equatable { case both, sa, lte }
+
 enum ModemCommand: Equatable {
     case network(json: Bool)
+    case antennas(json: Bool)
     case radio(on: Bool?)                       // nil: show
     case mode(String?)                          // nil: show; else the mode as typed, upper-cased, the RATs in
                                                 // the order typed: one canonicalMode accepts, not its reordered
@@ -27,6 +30,8 @@ enum ModemCommand: Equatable {
                 redial: Bool)
     case sim(json: Bool)
     case simUnlock(lastAttempt: Bool)
+    case simSlot(json: Bool)                    // the slot in use
+    case simSlotSet(Int, yes: Bool)             // 1 or 2
     case usbMode(json: Bool)
     case usbModeSet(UsbNetMode, reboot: Bool, yes: Bool)    // reboot: no --no-reboot; yes: --yes
     case at(String, timeout: Int)               // one line atCommandProblem accepts; seconds, 1 to 300
@@ -34,29 +39,47 @@ enum ModemCommand: Equatable {
     case bands(json: Bool)
     case bandsSet(BandRat, [Int])               // the bands sorted, each once (at least one)
     case bandsReset(BandRat?)                   // nil: lte, nsa and sa, in that order
+    case cellShow(json: Bool)
+    case cellLockNr(NrCellLock)
+    case cellLockCurrent(scsKHz: Int?)          // the serving cell's SCS when the modem gives none (`--scs`)
+    case cellLockLte([LteLockedCell])
+    case cellUnlock(CellUnlockScope)
+    case cellPersist(Bool)
+    case imeiShow(json: Bool)
+    case imeiSet(String, reboot: Bool, yes: Bool)
+    case imeiHistory(json: Bool)               // reads only the history file; never the AT port
 
-    /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set and bands reset: main.swift
-    /// ignores the stopping signals for these. Not `at`: it sends what the owner typed, as an AT terminal would,
-    /// and Ctrl-C stops it (the modem may still carry out a command already sent).
+    /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set/reset, cell lock/persist
+    /// and imei set: main.swift ignores the stopping signals for these. Not `at`: it sends what the owner
+    /// typed, as an AT terminal would, and Ctrl-C stops it (the modem may still carry out a command already sent).
     var changesModem: Bool {
         switch self {
-        case .network, .apnShow, .sim, .usbMode, .at, .atRefused, .bands: return false
+        case .network, .antennas, .apnShow, .sim, .usbMode, .at, .atRefused, .bands, .cellShow, .imeiShow,
+             .imeiHistory, .simSlot:
+            return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
-        case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset: return true
+        case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset,
+             .cellLockNr, .cellLockCurrent, .cellLockLte, .cellUnlock, .cellPersist, .imeiSet, .simSlotSet:
+            return true
         }
     }
 }
 
-let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"]
+let modemVerbs: Set<String> = ["network", "antennas", "radio", "mode", "apn", "sim", "usbmode", "at", "bands",
+                               "cell", "imei"]
 
 /// Appended to main.swift's usage line.
-let modemUsage = "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
-    + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-    + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+let modemUsage = "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
+    + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
+    + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
+    + "sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes] | "
     + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
     + "at [--timeout <seconds>] <command> | "
-    + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]"
+    + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
+    + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>] | "
+    + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
+    + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]"
 
 // MARK: - Parsing
 
@@ -67,6 +90,8 @@ func parseModem(_ words: [String]) -> ModemCommand? {
     switch verb {
     case "network":
         return jsonOption(rest).map { .network(json: $0) }
+    case "antennas":
+        return jsonOption(rest).map { .antennas(json: $0) }
     case "radio":
         switch rest {
         case []: return .radio(on: nil)
@@ -82,6 +107,7 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         if rest.first == "set" { return parseApnSet(Array(rest.dropFirst())) }
         return jsonOption(rest.first == "show" ? Array(rest.dropFirst()) : rest).map { .apnShow(json: $0) }
     case "sim":
+        if rest.first == "slot" { return parseSimSlotWords(Array(rest.dropFirst())) }
         guard rest.first == "unlock" else { return jsonOption(rest).map { .sim(json: $0) } }
         switch Array(rest.dropFirst()) {
         case []: return .simUnlock(lastAttempt: false)
@@ -106,9 +132,97 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         default:
             return jsonOption(rest).map { .bands(json: $0) }
         }
+    case "cell":
+        return parseCell(rest)
+    case "imei":
+        if rest.first == "set" { return parseImeiSet(Array(rest.dropFirst())) }
+        if rest.first == "history" { return jsonOption(Array(rest.dropFirst())).map { .imeiHistory(json: $0) } }
+        return jsonOption(rest).map { .imeiShow(json: $0) }
     default:
         return nil
     }
+}
+
+private func parseAsciiInt(_ word: String) -> Int? {
+    guard !word.isEmpty, word.unicodeScalars.allSatisfy({ (0x30...0x39).contains($0.value) }) else { return nil }
+    return Int(word)
+}
+
+private func parseCell(_ words: [String]) -> ModemCommand? {
+    switch words.first {
+    case "lock":
+        let args = Array(words.dropFirst())
+        switch args {
+        case ["current"]:
+            return .cellLockCurrent(scsKHz: nil)
+        case _ where args.count == 3 && args[0] == "current" && args[1] == "--scs":
+            return parseAsciiInt(args[2]).map { .cellLockCurrent(scsKHz: $0) }
+        case _ where args.count == 5 && args[0] == "sa":
+            let bandRaw = (args[4].first == "n" || args[4].first == "N") ? String(args[4].dropFirst()) : args[4]
+            guard let pci = parseAsciiInt(args[1]),
+                  let arfcn = parseAsciiInt(args[2]),
+                  let scs = parseAsciiInt(args[3]),
+                  let band = parseBandNumber(bandRaw[...]) else { return nil }
+            return .cellLockNr(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: scs, band: band))
+        case _ where args.count == 2 && args[0] == "lte":
+            let items = args[1].split(separator: ",", omittingEmptySubsequences: false)
+            guard !items.isEmpty else { return nil }
+            var cells: [LteLockedCell] = []
+            for item in items {
+                let parts = item.split(separator: ":", omittingEmptySubsequences: false)
+                guard parts.count == 2,
+                      let earfcn = parseAsciiInt(String(parts[0])),
+                      let pci = parseAsciiInt(String(parts[1])) else { return nil }
+                cells.append(LteLockedCell(earfcn: earfcn, pci: pci))
+            }
+            return .cellLockLte(cells)
+        default:
+            return nil
+        }
+    case "unlock":
+        switch words.dropFirst().map({ $0 }) {
+        case []: return .cellUnlock(.both)
+        case ["sa"]: return .cellUnlock(.sa)
+        case ["lte"]: return .cellUnlock(.lte)
+        default: return nil
+        }
+    case "persist":
+        switch words.dropFirst().map({ $0 }) {
+        case ["on"]: return .cellPersist(true)
+        case ["off"]: return .cellPersist(false)
+        default: return nil
+        }
+    default:
+        return jsonOption(words).map { .cellShow(json: $0) }
+    }
+}
+
+/// The words after `sim slot`: nothing or `--json` (show), or `set` and the slot (`1` or `2`) with `--yes` at most once.
+private func parseSimSlotWords(_ words: [String]) -> ModemCommand? {
+    guard words.first == "set" else { return jsonOption(words).map { .simSlot(json: $0) } }
+    let rest = Array(words.dropFirst())
+    guard let slotWord = rest.first, let slot = Int(slotWord), simSlots.contains(slot), slotWord.count == 1 else { return nil }
+    switch Array(rest.dropFirst()) {
+    case []: return .simSlotSet(slot, yes: false)
+    case ["--yes"]: return .simSlotSet(slot, yes: true)
+    default: return nil
+    }
+}
+
+private func parseImeiSet(_ words: [String]) -> ModemCommand? {
+    guard let value = words.first, !value.hasPrefix("--") else { return nil }
+    var reboot = true
+    var yes = false
+    var seen = Set<String>()
+    for option in words.dropFirst() {
+        guard seen.insert(option).inserted else { return nil }
+        switch option {
+        case "--no-reboot": reboot = false
+        case "--yes": yes = true
+        default: return nil
+        }
+    }
+    return .imeiSet(value, reboot: reboot, yes: yes)
 }
 
 /// The words after `bands set`: the RAT (lower case, as printed in the usage), then one word of band numbers
@@ -238,13 +352,16 @@ private func parseApnSet(_ words: [String]) -> ModemCommand? {
 /// driver's `RMNetProfile` (nil when the driver is not attached); `readSecret` reads a password or PIN without
 /// echo after showing its prompt (nil without a terminal); `ask` shows a question on the terminal and reads
 /// one line (nil without a terminal, see `askOnTerminal`); `output` prints one line on standard output,
-/// `errorOutput` one on standard error (only `at` uses it).
+/// `errorOutput` one on standard error (only `at` uses it). `imeiHistory`: where `imei set` records its change and
+/// `imei history` reads (main.swift gives ImeiHistoryFile.standard); nil records nothing, and `imei history` fails.
 func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int?,
               readSecret: (String) -> String?, ask: (String) -> String?, output: (String) -> Void,
-              errorOutput: (String) -> Void) -> Int32 {
+              errorOutput: (String) -> Void, imeiHistory: ImeiHistoryRecorder? = nil) -> Int32 {
     switch command {
     case .network(let json):
         return showNetwork(service, json: json, output)
+    case .antennas(let json):
+        return showAntennas(service, json: json, output)
     case .radio(let on):
         guard let on else { return showRadio(service, output) }
         switch service.setRadio(on: on) {
@@ -275,6 +392,16 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         }
     case .simUnlock(let lastAttempt):
         return unlockSim(service, lastAttempt: lastAttempt, readSecret: readSecret, output)
+    case .simSlot(let json):
+        switch service.simSlot() {
+        case .failure(let failure): return fail("sim", failure.message, output)
+        case .success(let slot):
+            if json { return outputJSON("sim", ["activeSlot": slot], output) }
+            output("sim: slot \(slot)")
+            return 0
+        }
+    case let .simSlotSet(slot, yes):
+        return setSimSlot(service, slot, yes: yes, ask: ask, output)
     case .usbMode(let json):
         return showUsbMode(service, json: json, output)
     case let .usbModeSet(mode, reboot, yes):
@@ -291,6 +418,59 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         return changeBands(service, [rat], output) { _ in bands }
     case .bandsReset(let rat):
         return changeBands(service, rat.map { [$0] } ?? BandRat.allCases, output) { $0.supported }
+    case .cellShow(let json):
+        return showCell(service, json: json, output)
+    case .cellLockNr(let lock):
+        switch service.setNrCellLock(lock) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .cellLockCurrent(let scs):
+        // The serving cell is read and locked in one port session (ModemService.lockCellInUse); its subcarrier
+        // spacing is the modem's, or `--scs` when the modem gives none, never guessed.
+        switch service.lockCellInUse(.serving(scsKHz: scs)) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .cellLockLte(let cells):
+        switch service.setLteCellLock(cells) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .cellUnlock(let scope):
+        return unlockCell(service, scope: scope, output)
+    case .cellPersist(let persist):
+        switch service.setCellLockPersist(lte: persist, nr: persist) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .imeiShow(let json):
+        switch service.imei() {
+        case .failure(let failure): return fail("imei", failure.message, output)
+        case .success(let value):
+            if json { return outputJSON("imei", imeiJSON(value), output) }
+            output("imei: \(value)")
+            return 0
+        }
+    case let .imeiSet(value, reboot, yes):
+        return setImei(service, value, reboot: reboot, yes: yes, ask: ask, history: imeiHistory, output)
+    case .imeiHistory(let json):
+        guard let keeper = imeiHistory?.keeper else { return fail("imei", "No IMEI history is kept here.", output) }
+        switch keeper.load() {
+        case .failure(let failure): return fail("imei", failure.message, output)
+        case .success(let history):
+            if json { return outputJSON("imei", imeiHistoryJSON(history, location: keeper.location), output) }
+            for line in imeiHistoryLines(history, location: keeper.location) { output(line) }
+            return 0
+        }
     }
 }
 
@@ -317,6 +497,171 @@ private func showNetwork(_ service: ModemServing, json: Bool, _ output: (String)
     case .success(let info):
         if json { return outputJSON("network", networkJSON(info), output) }
         for row in networkRows(info) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func showAntennas(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.antennas() {
+    case .failure(let failure): return fail("antennas", failure.message, output)
+    case .success(let sets):
+        if json { return outputJSON("antennas", antennasJSON(sets), output) }
+        if sets.isEmpty {
+            output("antennas: none reported")
+            return 0
+        }
+        for row in antennaRows(sets) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func showCell(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.cellLock() {
+    case .failure(let failure): return fail("cell", failure.message, output)
+    case .success(let state):
+        if json { return outputJSON("cell", cellLockJSON(state), output) }
+        for row in cellLockRows(state) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ output: (String) -> Void) -> Int32 {
+    switch scope {
+    case .sa:
+        switch service.setNrCellLock(nil) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .lte:
+        switch service.setLteCellLock([]) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .both:
+        let state: CellLockState
+        switch service.cellLock() {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let read): state = read
+        }
+        if !state.isLocked {
+            output("cell: already unlocked")
+            return 0
+        }
+        if state.nr != nil {
+            switch service.setNrCellLock(nil) {
+            case .failure(let failure): return fail("cell", failure.message, output)
+            case .success(let ch): output("cell: \(cellLockSentence(ch))")
+            }
+        }
+        if !state.lte.isEmpty {
+            switch service.setLteCellLock([]) {
+            case .failure(let failure): return fail("cell", failure.message, output)
+            case .success(let ch): output("cell: \(cellLockSentence(ch))")
+            }
+        }
+        return 0
+    }
+}
+
+/// `imei set`. Reads the IMEI and the module first (one port open), then asks (unless --yes; without a terminal it
+/// changes nothing and exits 2), also with --no-reboot, naming both IMEIs and the module, and writes only on that module
+/// over that IMEI (ImeiExpectation, checked on the port that writes): a modem swapped or changed meanwhile is left as it
+/// is. A module that gives no serial number is not changed (the change could not be tied to it). Once the change has
+/// been sent to the service (not when it is refused before, the IMEI is already the one asked or the question is
+/// cancelled), it is recorded in the IMEI history, succeeded or failed, with the module and the IMEI before as the
+/// change's own port open read them (ImeiWrite); a history that cannot be written adds a line saying so and does not
+/// change the exit code. An IMEI written whose restart failed prints its sentence and the way back, and exits 1.
+private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes: Bool,
+                     ask: (String) -> String?, history: ImeiHistoryRecorder?, _ output: (String) -> Void) -> Int32 {
+    if let problem = imeiProblem(value) { return fail("imei", "\(problem) Nothing was changed.", output) }
+    let reading: ImeiReading
+    switch service.imeiReading() {
+    case .failure(let failure): return fail("imei", failure.message, output)
+    case .success(let read):
+        if read.imei == value {
+            output("imei: already \(value); nothing changed")
+            return 0
+        }
+        reading = read
+    }
+    guard let module = reading.module else {
+        return fail("imei", "The modem gives no USB serial number, so the change cannot be tied to this module. "
+                    + "Nothing was changed.", output)
+    }
+    if !yes {
+        let what = "The IMEI of module \(module) will change from \(reading.imei) to \(value). "
+        let question = reboot ? what + restartQuestion
+            : what + "It takes effect at the next restart. Continue? [y/N] "
+        guard let answer = ask(question) else {
+            output("imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking")
+            return 2
+        }
+        guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            output("cancelled; nothing changed")
+            return 1
+        }
+    }
+    let write = service.setImei(value, reboot: reboot, expect: ImeiExpectation(module: module, before: reading.imei))
+    let outcome = write.outcome
+    if let history, let entry = imeiHistoryEntry(after: value, before: write.before, restart: reboot, outcome: outcome,
+                                                 source: .cli, module: write.module, at: history.now()),
+       let problem = history.keeper.append(entry) {
+        output("imei: the change was not recorded in the IMEI history. \(problem)")
+    }
+    switch outcome {
+    case .failure(let failure):
+        return fail("imei", failure.message, output)
+    case .success(let change):
+        output("imei: \(imeiSentence(change))")
+        switch change {
+        case .unchanged:
+            return 0
+        case .rebooting(let before, _), .setTakesEffectAfterRestart(let before, _):
+            output("imei: to put it back: RMNet imei set \(before)")
+            return 0
+        case .restartFailed(let before, _, _):
+            output("imei: to put it back: RMNet imei set \(before)")
+            return 1
+        }
+    }
+}
+
+/// `sim slot set`: reads the slot first (nothing asked or sent when it is already that one), asks (unless --yes; without a
+/// terminal it changes nothing and exits 2), then switches and waits for the new slot's SIM and the registration, and
+/// prints what came of it and the way back. A new slot without a usable SIM is still a switch made: exit 0.
+private func setSimSlot(_ service: ModemServing, _ slot: Int, yes: Bool, ask: (String) -> String?,
+                        _ output: (String) -> Void) -> Int32 {
+    let before: Int
+    switch service.simSlot() {
+    case .failure(let failure): return fail("sim", failure.message, output)
+    case .success(let current):
+        if current == slot {
+            output("sim: already on SIM \(slot); nothing changed")
+            return 0
+        }
+        before = current
+    }
+    if !yes {
+        let q = simSlotQuestion(from: before, to: slot)
+        guard let answer = ask("\(q.message) \(q.title) [y/N] ") else {
+            output("sim: no terminal to ask on, so nothing changed; run again with --yes to switch without asking")
+            return 2
+        }
+        guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            output("cancelled; nothing changed")
+            return 1
+        }
+    }
+    switch service.setSimSlot(slot, wait: .registration) {
+    case .failure(let failure):
+        return fail("sim", failure.message, output)
+    case .success(let change):
+        output("sim: \(simSlotSentence(change))")
+        if change.changed { output("sim: to switch back: RMNet sim slot set \(change.before)") }
         return 0
     }
 }

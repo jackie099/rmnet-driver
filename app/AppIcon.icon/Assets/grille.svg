@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" color-interpolation="sRGB">
+  <defs>
+    <linearGradient id="aluminium" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="58" y2="0">
+      <stop offset="0" stop-color="#B0B5BA"/>
+      <stop offset="0.033" stop-color="#CCD0D3"/>
+      <stop offset="0.069" stop-color="#E6E8E9"/>
+      <stop offset="0.105" stop-color="#DFE1E3"/>
+      <stop offset="0.31" stop-color="#D7DADD"/>
+      <stop offset="0.36" stop-color="#DADDDF"/>
+      <stop offset="0.59" stop-color="#CED2D5"/>
+      <stop offset="0.63" stop-color="#D0D4D7"/>
+      <stop offset="0.846" stop-color="#C5CACD"/>
+      <stop offset="0.88" stop-color="#C0C5C9"/>
+      <stop offset="0.94" stop-color="#A3AAB0"/>
+      <stop offset="1" stop-color="#8B949C"/>
+    </linearGradient>
+    <clipPath id="mouth" clipPathUnits="userSpaceOnUse">
+      <path d="M217 558 H1031 C1058 558 1077 578 1077 604 V915
+    C1077 943 1057 962 1031 962 H218 C192 962 172 942 172 915 V604
+    C172 578 190 558 217 558 Z"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(95.196 65.907) scale(0.670103)">
+    <g clip-path="url(#mouth)" fill="url(#aluminium)">
+      <rect x="0" y="-4" width="58" height="412" transform="matrix(1 0 0.958 1 -143 558)"/>
+      <rect x="0" y="-4" width="58" height="412" transform="matrix(1 0 0.958 1 4 558)"/>
+      <rect x="0" y="-4" width="58" height="412" transform="matrix(1 0 0.958 1 149 558)"/>
+      <rect x="0" y="-4" width="58" height="412" transform="matrix(1 0 0.958 1 294 558)"/>
+      <rect x="0" y="-4" width="59" height="412" transform="matrix(1 0 0.958 1 439 558)"/>
+      <rect x="0" y="-4" width="59" height="412" transform="matrix(1 0 0.958 1 584 558)"/>
+      <rect x="0" y="-4" width="58" height="412" transform="matrix(1 0 0.958 1 722 558)"/>
+      <rect x="0" y="-4" width="59" height="412" transform="matrix(1 0 0.958 1 863 558)"/>
+    </g>
+  </g>
+</svg>

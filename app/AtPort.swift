@@ -4,6 +4,7 @@
 import Foundation
 import IOKit
 import IOUSBHost
+import notify
 
 enum AtError: Error, Equatable {
     case modemNotAttached      // no RM520N-GL (2c7c:0801) on USB: the AT port is used on that model only
@@ -105,7 +106,7 @@ struct AtAnswerCollector {
         line == "ERROR" || line.hasPrefix("+CME ERROR:") || line.hasPrefix("+CMS ERROR:") || otherFinalResults.contains(line)
     }
 
-    private static func clean(_ bytes: ArraySlice<UInt8>) -> String {
+    fileprivate static func clean(_ bytes: ArraySlice<UInt8>) -> String {
         String(decoding: bytes.filter { $0 >= 0x20 || $0 == 0x09 }, as: UTF8.self)
             .trimmingCharacters(in: .whitespaces)
     }
@@ -114,6 +115,96 @@ struct AtAnswerCollector {
     private static func withoutPrompt(_ line: String) -> String {
         guard line.hasPrefix(">") else { return line }
         return String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+    }
+}
+
+/// One unsolicited PDU delivery (`+CMT: [<alpha>],<length>` followed by its hex line) read from the port while
+/// `AT+CNMI` is `2,2`. Kept in memory only until `SmsService` writes it to the modem's message store.
+struct AtDeliveredPdu: Equatable {
+    let tpduLength: Int
+    let hex: String
+}
+
+/// Watches the bytes read from the port for unsolicited SMS lines that would otherwise be discarded before a command's
+/// echo or during a drain:
+/// - `+CMTI:` with no storage name (`+CMTI: ,3`) or a negative index (`+CMTI: ,-1`), which the RM520N-GL sends when an
+///   incoming WAP Push (such as an MMS notification) cannot be stored under `AT+CNMI=2,1`;
+/// - `+CMT: [<alpha>],<length>` followed by its hex PDU line (`(1 + scOctets + length) * 2 == hex.count`), sent while
+///   `AT+CNMI` is `2,2` (during `sms unblock`, or if an earlier process died before restoring `2,1`).
+/// Pure: no I/O, nothing logged.
+struct AtUnsolicitedReader {
+    private var buffer: [UInt8] = []
+    private var pendingLength: Int? = nil
+    private(set) var sawBlockedCmti = false
+    private(set) var deliveries: [AtDeliveredPdu] = []
+
+    var waitingForHex: Bool { pendingLength != nil }
+
+    mutating func feed<Bytes: Sequence>(_ bytes: Bytes) where Bytes.Element == UInt8 {
+        buffer.append(contentsOf: bytes)
+        while let end = buffer.firstIndex(where: { $0 == 0x0D || $0 == 0x0A }) {
+            let text = AtAnswerCollector.clean(buffer[..<end])
+            buffer.removeSubrange(...end)
+            if !text.isEmpty { take(text) }
+        }
+    }
+
+    mutating func takeDeliveries() -> [AtDeliveredPdu] {
+        let taken = deliveries
+        deliveries = []
+        return taken
+    }
+
+    mutating func takeBlockedFlag() -> Bool {
+        let flag = sawBlockedCmti
+        sawBlockedCmti = false
+        return flag
+    }
+
+    private mutating func take(_ line: String) {
+        if let length = pendingLength {
+            if AtUnsolicitedReader.matchesCmtHex(line, tpduLength: length) {
+                deliveries.append(AtDeliveredPdu(tpduLength: length, hex: line))
+                pendingLength = nil
+                return
+            }
+            if line == "OK" || AtAnswerCollector.isErrorResult(line) {
+                pendingLength = nil
+            }
+        }
+        if let length = AtUnsolicitedReader.cmtLength(line) {
+            pendingLength = length
+            return
+        }
+        if AtUnsolicitedReader.isBlockedCmti(line) {
+            sawBlockedCmti = true
+        }
+    }
+
+    static func isBlockedCmti(_ line: String) -> Bool {
+        guard line.hasPrefix("+CMTI:") else { return false }
+        let rest = line.dropFirst("+CMTI:".count)
+        guard let comma = rest.lastIndex(of: ",") else { return false }
+        let mem = rest[..<comma].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "")
+        let indexText = rest[rest.index(after: comma)...].trimmingCharacters(in: .whitespaces)
+        guard let index = Int(indexText) else { return false }
+        return mem.isEmpty || index < 0
+    }
+
+    static func cmtLength(_ line: String) -> Int? {
+        guard line.hasPrefix("+CMT:") else { return nil }
+        let rest = line.dropFirst("+CMT:".count)
+        guard let comma = rest.lastIndex(of: ",") else { return nil }
+        let lengthText = rest[rest.index(after: comma)...].trimmingCharacters(in: .whitespaces)
+        guard let length = Int(lengthText), length > 0 else { return nil }
+        return length
+    }
+
+    static func matchesCmtHex(_ line: String, tpduLength: Int) -> Bool {
+        guard tpduLength > 0, line.utf8.count >= 4, line.utf8.count % 2 == 0,
+              line.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x41...0x46).contains($0) || (0x61...0x66).contains($0) }),
+              let sc = Int(line.prefix(2), radix: 16) else { return false }
+        return (1 + sc + tpduLength) * 2 == line.utf8.count
     }
 }
 
@@ -178,6 +269,58 @@ final class AtPort {
     private static let ctrlZ: UInt8 = 0x1A
     private static let escape: UInt8 = 0x1B
 
+    /// Posted (with no payload) when a command-line RMNet verb sees a storage-less `+CMTI:` or rescues a `+CMT` PDU on
+    /// the port, so a running RMNet app on this Mac hears of a blocked incoming queue even when another program (including
+    /// a privileged helper) opened the port first.
+    static let blockedSmsNotifyKey = "io.rmnetdriver.RMNet.smsBlocked"
+    static let blockedSmsNotification = Notification.Name(blockedSmsNotifyKey)
+    private static let noticeLock = NSLock()
+    private static var blockedHandler: (() -> Void)?
+    private static var rescued: [AtDeliveredPdu] = []
+
+    /// Sets the running app's callback for a blocked incoming SMS notice or an unsolicited `+CMT` delivery read outside
+    /// `SmsService`. Without one (a command-line verb), `blockedSmsNotifyKey` and `blockedSmsNotification` are posted.
+    static func setBlockedSmsHandler(_ handler: (() -> Void)?) {
+        noticeLock.lock()
+        blockedHandler = handler
+        noticeLock.unlock()
+    }
+
+    /// Any `+CMT` PDUs read on ports that closed without storing them, kept in memory so `SmsService` can write them.
+    static func takeRescuedDeliveries() -> [AtDeliveredPdu] {
+        noticeLock.lock()
+        defer { noticeLock.unlock() }
+        let taken = rescued
+        rescued = []
+        return taken
+    }
+
+    static func keepRescuedDeliveries(_ items: [AtDeliveredPdu]) {
+        guard !items.isEmpty else { return }
+        noticeLock.lock()
+        rescued = items + rescued
+        noticeLock.unlock()
+    }
+
+    static var hasRescuedDeliveries: Bool {
+        noticeLock.lock()
+        defer { noticeLock.unlock() }
+        return !rescued.isEmpty
+    }
+
+    private static func notifyBlockedSms() {
+        noticeLock.lock()
+        let handler = blockedHandler
+        noticeLock.unlock()
+        if let handler {
+            handler()
+        } else {
+            notify_post(blockedSmsNotifyKey)
+            DistributedNotificationCenter.default().postNotificationName(
+                blockedSmsNotification, object: nil, userInfo: nil, deliverImmediately: true)
+        }
+    }
+
     private let lock = NSLock()
     private var interface: IOUSBHostInterface?
     private var input: IOUSBHostPipe?
@@ -186,12 +329,18 @@ final class AtPort {
     // transfer that ends by its timeout cannot have received anything that would be lost.
     private let readSize: Int
     private var echoes = false  // learned at open()
+    private var unsolicited = AtUnsolicitedReader()
+    /// The USB serial number of the device this port was opened on (read from that device's own registry entry when the
+    /// port opened, so it is the module the commands go to, not another one attached since); nil when it gives none.
+    let deviceSerial: String?
 
-    private init(interface: IOUSBHostInterface, input: IOUSBHostPipe, output: IOUSBHostPipe, readSize: Int) {
+    private init(interface: IOUSBHostInterface, input: IOUSBHostPipe, output: IOUSBHostPipe, readSize: Int,
+                 deviceSerial: String?) {
         self.interface = interface
         self.input = input
         self.output = output
         self.readSize = readSize
+        self.deviceSerial = deviceSerial
     }
 
     deinit { close() }
@@ -209,6 +358,10 @@ final class AtPort {
             Thread.sleep(forTimeInterval: busyRetryInterval)
         }
     }
+
+    /// One try, no waiting: busy at once while another program holds the interface. For reads that are only worth
+    /// making when the port is free (the menu bar's signal bars), so that they never hold up the program that has it.
+    static func openWithoutWaiting() -> Result<AtPort, AtError> { openOnce() }
 
     private static func openOnce() -> Result<AtPort, AtError> {
         let device = matchingService("IOUSBHostDevice", ["idVendor": vendor, "idProduct": product])
@@ -238,7 +391,8 @@ final class AtPort {
         do {
             let input = try iface.copyPipe(withAddress: Int(endpoints.input))
             let output = try iface.copyPipe(withAddress: Int(endpoints.output))
-            port = AtPort(interface: iface, input: input, output: output, readSize: endpoints.inputPacketSize)
+            port = AtPort(interface: iface, input: input, output: output, readSize: endpoints.inputPacketSize,
+                          deviceSerial: usbSerial(of: device))
         } catch {
             iface.destroy()
             return .failure(.io(ioStatus(error)))
@@ -251,16 +405,63 @@ final class AtPort {
     }
 
     func close() {
+        let shouldNotify: Bool
         lock.lock()
-        defer { lock.unlock() }
-        closeLocked()
+        shouldNotify = closeLocked(rescueToModem: true)
+        lock.unlock()
+        if shouldNotify { AtPort.notifyBlockedSms() }
     }
 
-    private func closeLocked() {
+    @discardableResult
+    private func closeLocked(rescueToModem: Bool) -> Bool {
+        let blocked = unsolicited.takeBlockedFlag()
+        var leftover = unsolicited.takeDeliveries()
+        let hadDeliveries = !leftover.isEmpty
+        if rescueToModem, !leftover.isEmpty, output != nil {
+            leftover = storeRescuedOnModemLocked(leftover)
+        }
+        if !leftover.isEmpty { AtPort.keepRescuedDeliveries(leftover) }
         input = nil
         output = nil
         interface?.destroy()
         interface = nil
+        return blocked || hadDeliveries
+    }
+
+    /// When a non-SMS command (such as `RMNet network` run by another process during an unblock pause) reads an
+    /// unsolicited `+CMT` delivery on this port, write it to the modem's store as unread (`AT+CMGW=<length>,0`) before
+    /// closing the interface so a short-lived CLI process never loses a message.
+    private func storeRescuedOnModemLocked(_ items: [AtDeliveredPdu]) -> [AtDeliveredPdu] {
+        guard case .success = commandLocked("AT+CMGF=0", timeout: 2),
+              case .success(let cpms) = commandLocked("AT+CPMS?", timeout: 2),
+              var room = AtPort.writableStoreRoom(cpms), room > 0 else {
+            return items
+        }
+        for (i, item) in items.enumerated() {
+            guard room > 0 else { return Array(items[i...]) }
+            let sc = Int(item.hex.prefix(2), radix: 16) ?? -1
+            let computed = sc >= 0 ? (item.hex.utf8.count / 2 - 1 - sc) : 0
+            let length = computed > 0 ? computed : item.tpduLength
+            guard case .success(let lines) = sendLocked("AT+CMGW=\(length),0", afterPrompt: item.hex, timeout: 5),
+                  lines.contains(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("+CMGW:") }) else {
+                return Array(items[i...])
+            }
+            room -= 1
+        }
+        return []
+    }
+
+    private static func writableStoreRoom(_ lines: [String]) -> Int? {
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("+CPMS:") else { continue }
+            let fields = line.dropFirst("+CPMS:".count).split(separator: ",", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard fields.count >= 6, fields[0].hasPrefix("\""), fields[0] == fields[3],
+                  let used = Int(fields[1]), let total = Int(fields[2]), used >= 0, total >= used else { return nil }
+            return total - used
+        }
+        return nil
     }
 
     // Probes with "AT" until two answers in a row agree on whether the port echoes (AtEchoProbe),
@@ -298,6 +499,10 @@ final class AtPort {
     func command(_ line: String, timeout: TimeInterval = 3) -> Result<[String], AtError> {
         lock.lock()
         defer { lock.unlock() }
+        return commandLocked(line, timeout: timeout)
+    }
+
+    private func commandLocked(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> {
         guard output != nil else { return .failure(.io(kIOReturnNotOpen)) }
         discardUnsolicited()
         if let failure = write(Array(line.utf8) + [UInt8(ascii: "\r")]) { return closingOnTimeout(.failure(failure)) }
@@ -305,12 +510,16 @@ final class AtPort {
         return closingOnTimeout(answer(wait(&collector, until: Date().addingTimeInterval(timeout))))
     }
 
-    // For AT+CMGS: sends `line`, waits for the "> " prompt, sends `payload` followed by Ctrl-Z (0x1A),
+    // For AT+CMGS / AT+CMGW: sends `line`, waits for the "> " prompt, sends `payload` followed by Ctrl-Z (0x1A),
     // then returns the lines before the final "OK". If the prompt does not come, sends ESC (0x1B) and
     // fails with .timeout.
     func send(_ line: String, afterPrompt payload: String, timeout: TimeInterval) -> Result<[String], AtError> {
         lock.lock()
         defer { lock.unlock() }
+        return sendLocked(line, afterPrompt: payload, timeout: timeout)
+    }
+
+    private func sendLocked(_ line: String, afterPrompt payload: String, timeout: TimeInterval) -> Result<[String], AtError> {
         guard output != nil else { return .failure(.io(kIOReturnNotOpen)) }
         discardUnsolicited()
         // If the line reached the modem despite the failure, the modem may be at the prompt.
@@ -333,11 +542,50 @@ final class AtPort {
         return closingOnTimeout(answer(wait(&collector, until: Date().addingTimeInterval(timeout))))
     }
 
+    /// Reads unsolicited output for `duration` (extended by `extendOnDelivery`, up to `maxDuration` in all, while a
+    /// `+CMT` delivery arrives so a multi-part burst is not cut short). For `SmsService` while `AT+CNMI` is `2,2`.
+    func listen(duration: TimeInterval, extendOnDelivery: TimeInterval = 0.5,
+                maxDuration: TimeInterval = 1.4) -> Result<Void, AtError> {
+        var shouldNotify = false
+        defer { if shouldNotify { AtPort.notifyBlockedSms() } }
+        lock.lock()
+        defer { lock.unlock() }
+        guard input != nil else { return .failure(.io(kIOReturnNotOpen)) }
+        let start = Date()
+        let hardLimit = start.addingTimeInterval(max(duration, maxDuration))
+        var deadline = min(start.addingTimeInterval(max(0, duration)), hardLimit)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { return .success(()) }
+            let before = unsolicited.deliveries.count
+            let waitingBefore = unsolicited.waitingForHex
+            switch readOnce(timeout: min(left, AtPort.pollInterval)) {
+            case .success(let bytes):
+                if !bytes.isEmpty, unsolicited.deliveries.count > before || unsolicited.waitingForHex || waitingBefore {
+                    deadline = min(Date().addingTimeInterval(extendOnDelivery), hardLimit)
+                }
+            case .failure(.timeout):
+                continue
+            case .failure(let failure):
+                shouldNotify = closeLocked(rescueToModem: false)
+                return .failure(failure)
+            }
+        }
+    }
+
+    /// Takes the `+CMT` deliveries read on this port so far (including any read during `open()` or before a command).
+    func takeDeliveries() -> [AtDeliveredPdu] {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = unsolicited.takeBlockedFlag()
+        return unsolicited.takeDeliveries()
+    }
+
     // The modem may be at the "> " prompt: ESC cancels the half-entered command, and the port closes.
     // A failed ESC write is reported instead of `failure`.
     private func leavePrompt(after failure: AtError) -> Result<[String], AtError> {
         let escapeFailure = write([AtPort.escape])
-        closeLocked()
+        if closeLocked(rescueToModem: false) { DispatchQueue.global(qos: .utility).async { AtPort.notifyBlockedSms() } }
         switch escapeFailure {
         case nil: return .failure(failure)
         case .io(let status): return .failure(.io(status))
@@ -346,7 +594,9 @@ final class AtPort {
     }
 
     private func closingOnTimeout(_ result: Result<[String], AtError>) -> Result<[String], AtError> {
-        if case .failure(.timeout) = result { closeLocked() }
+        if case .failure(.timeout) = result, closeLocked(rescueToModem: false) {
+            DispatchQueue.global(qos: .utility).async { AtPort.notifyBlockedSms() }
+        }
         return result
     }
 
@@ -399,7 +649,9 @@ final class AtPort {
             let status = AtPort.ioStatus(error)
             return .failure(status == kIOReturnTimeout ? .timeout : .io(status))
         }
-        return .success(Array(UnsafeRawBufferPointer(start: buffer.bytes, count: count)))
+        let bytes = Array(UnsafeRawBufferPointer(start: buffer.bytes, count: count))
+        if !bytes.isEmpty { unsolicited.feed(bytes) }
+        return .success(bytes)
     }
 
     private func write(_ bytes: [UInt8]) -> AtError? {
@@ -426,6 +678,17 @@ final class AtPort {
     private static func hasExclusiveOwner(_ service: io_service_t) -> Bool {
         IORegistryEntryCreateCFProperty(service, "UsbExclusiveOwner" as CFString, kCFAllocatorDefault, 0)?
             .takeRetainedValue() != nil
+    }
+
+    // The device's "USB Serial Number" (as `ioreg` shows it), printable ASCII, at most 64 characters; nil without one.
+    private static func usbSerial(of device: io_service_t) -> String? {
+        for key in ["USB Serial Number", "kUSBSerialNumberString"] {
+            guard let value = IORegistryEntryCreateCFProperty(device, key as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue() as? String else { continue }
+            let serial = String(value.unicodeScalars.filter { $0.isASCII && $0.value >= 0x20 && $0.value < 0x7F }.prefix(64))
+            if !serial.isEmpty { return serial }
+        }
+        return nil
     }
 
     private static func matchingService(_ className: String, _ properties: [String: Any]) -> io_service_t {

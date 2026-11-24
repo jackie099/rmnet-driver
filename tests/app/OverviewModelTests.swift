@@ -53,6 +53,7 @@ struct OverviewModelTests {
     static func main() {
         signalHistory()
         placeholders()
+        lockBadge()
         readouts()
         qmiAdvice()
         simCards()
@@ -96,6 +97,19 @@ struct OverviewModelTests {
               "placeholder: the first read")
         equal(signalPlaceholder(saInfo, ServingSignalHistory(values: [-90], rat: "NR", reads: 1)), "Collecting…",
               "placeholder: one value")
+        equal(signalPlaceholder(nil, none, failure: "The RM520N-GL (USB 2c7c:0801) is not attached."), "No signal data",
+              "placeholder: the reads fail with nothing read")
+        equal(signalPlaceholder(nil, none, failure: nil), "Collecting…", "placeholder: no failure yet")
+        equal(signalPlaceholder(saInfo, ServingSignalHistory(values: [-90], rat: "NR", reads: 1), failure: "busy"),
+              "Collecting…", "placeholder: a failure after a read")
+    }
+
+    // The hero's lock badge: the first lock in words and how many more.
+    static func lockBadge() {
+        check(heroLockText([]) == nil, "lock badge: nothing locked")
+        equal(heroLockText(["5G SA cell n41 · PCI 186"]), "Locked: 5G SA cell n41 · PCI 186", "lock badge: one")
+        equal(heroLockText(["5G SA cell n41 · PCI 186", "5G SA bands n25, n41, n71"]),
+              "Locked: 5G SA cell n41 · PCI 186 +1", "lock badge: two")
     }
 
     // The serving leg's RSRP now, its name on its scale and its zone's quality.
@@ -134,7 +148,7 @@ struct OverviewModelTests {
         equal(simSummary(nil), SimSummary(state: CardState(text: "Not checked yet", symbol: "questionmark.circle",
                                                            tone: .neutral), action: "Open SIM & Data"), "SIM: not read")
         equal(simSummary(sim(.ready)), SimSummary(state: CardState(text: "Ready", symbol: "checkmark.circle.fill",
-                                                                   tone: .good), action: nil), "SIM: ready")
+                                                                   tone: .good), action: "Open SIM & Data"), "SIM: ready")
         equal(simSummary(sim(.pin)), SimSummary(state: CardState(text: "PIN required", symbol: "lock.fill",
                                                                  tone: .attention), action: "Unlock…"), "SIM: PIN required")
         let puk = simSummary(sim(.puk))
@@ -168,18 +182,18 @@ struct OverviewModelTests {
             driverSummary(headline: words ?? headline(s), status: s, known: known, bundledVersion: bundled)
         }
         var d = summary(driverStatus(state: "up"))
-        check(d.state.text == "Running" && d.state.tone == .good && d.action == nil && d.version == "Version 318.19.40",
-              "driver: running", "got \(d)")
+        check(d.state.text == "Running" && d.state.tone == .good && d.action == .details && d.actionTitle == "Details"
+                && d.version == "Version 318.19.40", "driver: running", "got \(d)")
         d = summary(driverStatus(modem: .absent))
-        check(d.state.text == "Enabled" && d.state.tone == .good && d.action == nil, "driver: enabled, no modem",
+        check(d.state.text == "Enabled" && d.state.tone == .good && d.action == .details, "driver: enabled, no modem",
               "got \(d)")
         d = summary(driverStatus(state: "up"), bundled: "318.20.1")
         check(d.state.text == "Update available" && d.state.tone == .attention && d.action == .update
               && d.actionTitle == "Update" && d.version == "Version 318.19.40 → 318.20.1", "driver: update", "got \(d)")
-        check(summary(driverStatus(state: "up"), bundled: "318.19.40").action == nil, "driver: same version, no update")
-        check(summary(driverStatus(state: "up"), bundled: "318.18.1").action == nil,
+        check(summary(driverStatus(state: "up"), bundled: "318.19.40").action == .details, "driver: same version, no update")
+        check(summary(driverStatus(state: "up"), bundled: "318.18.1").action == .details,
               "driver: an older bundled version (Replace) is no call to action")
-        check(summary(driverStatus(state: "up"), bundled: "").action == nil, "driver: no bundled version, no update")
+        check(summary(driverStatus(state: "up"), bundled: "").action == .details, "driver: no bundled version, no update")
         d = summary(driverStatus([ExtensionEntry(version: "318.19.40", enabled: false, awaitingApproval: true,
                                                  uninstalling: false)]))
         check(d.state.text == "Waiting for approval" && d.state.tone == .attention && d.action == .openSystemSettings
@@ -202,7 +216,7 @@ struct OverviewModelTests {
         check(d.state.text == "Status unknown" && d.state.tone == .error && d.action == .details,
               "driver: no listing", "got \(d)")
         d = summary(driverStatus(state: "up"), known: false, headline: "Connected")
-        check(d.state.text == "Running" && d.version == "Version —" && d.action == nil,
+        check(d.state.text == "Running" && d.version == "Version —" && d.action == .details,
               "driver: attached, the listing not known", "got \(d)")
 
         // A headline not known here is shown as the hero shows it, in orange with Details, never as green Running.
